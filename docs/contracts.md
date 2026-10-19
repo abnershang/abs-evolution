@@ -38,8 +38,14 @@ Public methods return JSON-compatible dictionaries unless stated otherwise:
 - `record_receipt(receipt: dict) -> dict`: strict bounded schema, opt-in only.
   Fields: `id`, `task_id`, `snapshot_id`, `outcome` (accepted/failed/unknown),
   `failure_tags` (list of safe identifiers), `evidence_refs` (opaque identifiers,
-  not raw transcripts, URLs or paths). Reject extra fields. Duplicate identical
-  IDs are idempotent; conflicting reuse fails. `list_receipts(limit=100)`.
+  not raw transcripts, URLs or paths). Optional `task_family` is a safe tag.
+  Optional `optimization_signals` is a list of at most 16 unique
+  `{"dimension":"quality|efficiency|method|reuse","tag":safe_identifier}`
+  objects. Nonempty signals require a task family and nonempty evidence refs.
+  Signals record hypotheses even when outcome is accepted; they are not scores,
+  verified improvements or permission to act. Reject undocumented fields.
+  Legacy payloads remain unchanged. Duplicate identical IDs are idempotent;
+  conflicting reuse fails. `list_receipts(limit=100)`.
 - `claim_experiment(*, baseline_id: str) -> dict`: in one transaction check
   foreground leases, concurrent claims, daily count/time-reservation budget;
   record a running claim with `id`, `policy_digest`, `baseline_id`. Reserve the
@@ -67,6 +73,16 @@ Public methods return JSON-compatible dictionaries unless stated otherwise:
 - `rollback(snapshot_id: str, *, expected_current: str, channel="stable") ->
   dict`: only to a snapshot previously accepted in that channel; CAS transition.
 - `status() -> dict`: local channels, active leases/claims and bounded counts.
+
+`summarize(receipts, *, min_occurrences=2)` groups observations by signal type,
+task family, dimension and tag, using distinct task IDs for the threshold.
+Explicit optimization signals can come from accepted, failed or unknown tasks;
+outcome alone never creates a signal. Their status is `needs_comparison`.
+Legacy failure tags still require a failed outcome and retain `failure_tag` and
+`needs_investigation`. Every group retains provenance and `observed_outcomes`;
+unknown does not become accepted. An absent family is null and is not pooled
+with named families. Global `outcome_counts` count receipts, not distinct tasks.
+This read-only summary neither establishes causation nor runs an experiment.
 
 ## Process isolation
 
@@ -152,6 +168,72 @@ Provider request shape is exactly `{"schema_version":1,"objective":str,
 Unknown top-level fields are rejected. A task's nested JSON keys are data, not
 provider permissions. Raw chat transcripts and holdout data are never inputs.
 
+## Opportunity classification
+
+`OpportunityJudge(judge, *, min_confidence=0.8, min_probability=0.8).assess(
+request, *, timeout_seconds=30, max_output_bytes=65536)` uses the JEV adapter for
+one primary-next-step Choice. Request fields are exactly `schema_version:1`,
+`task_family`, `objective`, `observation`, `outcome` and `evidence`.
+The family is a safe tag; outcome is accepted/failed/unknown. Objective and
+observation are nonempty UTF-8 text bounded to 2000 and 4000 bytes respectively.
+Evidence contains up to 16 unique `{id, summary}` records. IDs are opaque and
+summaries are bounded to 4000 bytes each. The full request is at most 65536 bytes.
+Empty evidence is allowed for an explicit insufficient-evidence judgment.
+This request contains reviewed observations, never protected acceptance cases.
+
+Choice options are `quality`, `efficiency`, `method`, `reuse`, `no_opportunity`
+and `insufficient_evidence`. The four dimensions select a primary hypothesis,
+not all applicable labels and not measured gains. Confident dimensions return
+`status=classified, next_step=compare`; confident no-opportunity returns
+`next_step=retain_baseline`. Insufficient evidence returns
+`status=deferred, next_step=gather_evidence`. Ties or threshold misses preserve
+the raw judgment but return `decision=uncertain, next_step=review_uncertainty`.
+Service failures remain typed errors. No retry, generator fallback, evidence
+retrieval or registry writes occur. CLI `classify` requires `--allow-external`
+and works without registry state; a zero exit code only means a judgment was
+returned, not that an experiment or adoption is authorized.
+
+The output keeps the original observed outcome, evidence IDs, complete judgment
+and usage metadata, configured thresholds, request fingerprint and rubric
+fingerprint. It omits objective, observation and evidence summaries. Input and
+output are credential-scanned and bounded. The request snapshot cannot change
+if the caller mutates its input during judgment. Both classification and hybrid
+routing share `validate_choice_result` for the external-result contract.
+
+## Experimental split opportunity assessment
+
+`OpportunityAssessment(judge, *, min_confidence=0.8, min_probability=0.8).assess(...)`
+and CLI `assess` use the same request schema, external opt-in and no-registry
+boundary as `classify`. The response is identified by
+`assessment_mode=split_opportunity_v1`; it is not a replacement classification.
+One batch contains `opportunity` as a Choice over `worth_comparing`,
+`no_opportunity` and `insufficient_evidence`, plus independent Noul questions
+`quality`, `efficiency`, `method` and `reuse`. Each question judges the same input,
+never another answer. Method can coexist with quality/efficiency; reuse requires
+an evidenced successful method and plausible transfer, not just an unfinished attempt.
+
+`opportunity` preserves the Choice answer. `dimensions` records each
+`probability_yes` and its status: supported at >=0.8, not_supported at <=0.2,
+otherwise uncertain. All answers survive presence gating and need not agree.
+`supported_dimensions` lists all supported labels, never a unique winner.
+Usage and duration belong to the batch, not to individual answers.
+Ties or presence threshold misses yield `review_uncertainty`; insufficient
+evidence yields `gather_evidence`. Confident no-opportunity with a supported
+dimension yields `review_conflict`, otherwise `retain_baseline`. Confident
+worth-comparing with no supported dimension yields `review_dimensions`, otherwise
+`compare`. Review/gather paths are deferred. All next steps are advisory.
+
+`JevJudge.judge_batch(state, *, questions, timeout_seconds, max_output_bytes)`
+accepts one to eight named Choice/Noul questions with nonempty string
+instructions and string criteria. Noul criteria are exactly `true` and `false`.
+The returned `BatchJudgment` has typed `ChoiceAnswer`/`NoulAnswer` entries and one
+set of model/usage/duration metadata. Exact answer IDs, types and finite bounded
+probabilities are required. `validate_batch_judgment` protects callers using
+other judge implementations too. A malformed answer fails the entire batch;
+there is no partial-result fallback or retry. Fixed endpoint, pinned model,
+credential scanning, bounded worker isolation and deadline enforcement also
+apply to batches. Neither this path nor `classify` generates candidate content.
+
 ## Typed judgment and conditional generation
 
 `JevJudge(model="jev-1.13.0").choose(state, *, instructions, criteria,
@@ -174,6 +256,9 @@ and `insufficient_evidence`. Program-owned confidence/probability thresholds
 are checked before routing. Confident reuse returns the exact validated
 proposal and makes no generator call. Confident generation invokes the
 configured generator once with the original request and remaining deadline.
+Route selection follows the stated objective and training evidence, including
+already-passing tasks. Failures are not required. Efficiency, method and reuse
+are proposal hypotheses; the route does not establish acceptance or gain.
 Missing generation capability, uncertainty or missing evidence blocks the
 round without a substitute patch. Service/validation failures remain errors
 and never trigger an implicit generator call.

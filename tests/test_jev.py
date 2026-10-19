@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
@@ -11,7 +12,14 @@ import urllib.request
 from unittest import mock
 
 from abs_evolution import _jev_http
-from abs_evolution.contracts import ChoiceResult, canonical_json
+from abs_evolution.contracts import (
+    BatchJudgment,
+    ChoiceAnswer,
+    ChoiceResult,
+    NoulAnswer,
+    canonical_json,
+    validate_batch_judgment,
+)
 from abs_evolution.errors import EvolutionError
 from abs_evolution.jev import DEFAULT_MODEL, JevJudge, _execute_worker
 
@@ -72,6 +80,50 @@ def encode_response(value: dict | None = None) -> bytes:
     return canonical_json(response() if value is None else value).encode("utf-8")
 
 
+def batch_questions() -> dict:
+    return {
+        "route": {
+            "type": "choice",
+            "instructions": "Select the supported route.",
+            "criteria": {"reuse": "Reuse a matching proposal.", "generate": "New content is justified."},
+        },
+        "has_regression": {
+            "type": "noul",
+            "instructions": "Is there a training regression?",
+            "criteria": {"true": "A regression is evidenced.", "false": "No regression is evidenced."},
+        },
+        "quality_opportunity": {
+            "type": "noul",
+            "instructions": "Is there a supported quality improvement opportunity?",
+            "criteria": {"true": "A quality opportunity is supported.", "false": "No quality opportunity is supported."},
+        },
+    }
+
+
+def batch_response(*, answers: dict | None = None, model: str | None = DEFAULT_MODEL, usage: dict | None = None) -> dict:
+    value = {
+        "answers": answers or {
+            "route": {
+                "type": "choice",
+                "choice": "reuse",
+                "probabilities": {"reuse": 0.8, "generate": 0.2},
+                "confidence": 0.6,
+            },
+            "has_regression": {"type": "noul", "noul": 0.03},
+            "quality_opportunity": {"type": "noul", "noul": 0.94},
+        }
+    }
+    if model is not None:
+        value["model"] = model
+    if usage is not None:
+        value["usage"] = usage
+    return value
+
+
+def encode_batch_response(value: dict | None = None) -> bytes:
+    return canonical_json(batch_response() if value is None else value).encode("utf-8")
+
+
 class _BinaryStream:
     def __init__(self, data: bytes = b"") -> None:
         self.buffer = io.BytesIO(data)
@@ -129,6 +181,31 @@ class JevJudgeTests(unittest.TestCase):
                     state() if state_value is None else state_value,
                     instructions=instructions,
                     criteria=_CRITERIA if criteria is None else criteria,
+                    timeout_seconds=timeout,
+                    max_output_bytes=output_limit,
+                )
+
+    def call_batch(
+        self,
+        raw_response: bytes,
+        *,
+        questions: dict | None = None,
+        timeout: float = 5,
+        output_limit: int = 8192,
+        seen: dict | None = None,
+    ) -> BatchJudgment:
+        def worker(payload: bytearray, *, deadline: float, response_limit: int) -> bytes:
+            if seen is not None:
+                seen["envelope"] = json.loads(bytes(payload).decode("utf-8"))
+                seen["deadline"] = deadline
+                seen["response_limit"] = response_limit
+            return raw_response if raw_response.startswith(b"ERR\n") else b"OK\n" + raw_response
+
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": _TEST_KEY}, clear=True):
+            with mock.patch("abs_evolution.jev._execute_worker", side_effect=worker):
+                return JevJudge().judge_batch(
+                    state(),
+                    questions=batch_questions() if questions is None else questions,
                     timeout_seconds=timeout,
                     max_output_bytes=output_limit,
                 )
@@ -324,6 +401,203 @@ class JevJudgeTests(unittest.TestCase):
             response_limit=1024,
         )
         self.assertEqual(wire, b"ERR\ninvalid_worker_request\n\n")
+
+    def test_batch_contract_rejects_oversized_text_and_huge_integers_at_both_boundaries(self) -> None:
+        questions = batch_questions()
+        valid_answers = {
+            "route": ChoiceAnswer("reuse", {"reuse": 0.8, "generate": 0.2}, 0.6),
+            "has_regression": NoulAnswer(0.03),
+            "quality_opportunity": NoulAnswer(0.94),
+        }
+        huge = 10**1000
+
+        # Direct typed-contract validation must reject values before math.isfinite
+        # tries converting an enormous Python integer to float.
+        malformed = []
+        for field in ("probability", "confidence", "noul", "duration"):
+            answers = dict(valid_answers)
+            duration = 0.01
+            if field == "probability":
+                answers["route"] = ChoiceAnswer("reuse", {"reuse": huge, "generate": 0}, 0.6)
+            elif field == "confidence":
+                answers["route"] = ChoiceAnswer("reuse", {"reuse": 0.8, "generate": 0.2}, huge)
+            elif field == "noul":
+                answers["has_regression"] = NoulAnswer(huge)
+            else:
+                duration = huge
+            malformed.append((field, BatchJudgment(answers, duration), questions))
+
+        for field, result, requested in malformed:
+            with self.subTest(field=field):
+                with self.assertRaises(EvolutionError) as caught:
+                    validate_batch_judgment(result, requested)
+                self.assertEqual(caught.exception.code, "provider_invalid_judgement")
+
+        for field in ("instructions", "criteria"):
+            oversized_questions = copy.deepcopy(questions)
+            if field == "instructions":
+                oversized_questions["route"]["instructions"] = "x" * 8193
+            else:
+                oversized_questions["route"]["criteria"]["reuse"] = "x" * 8193
+            with self.subTest(field=field):
+                with self.assertRaises(EvolutionError) as caught:
+                    validate_batch_judgment(BatchJudgment(valid_answers, 0.01), oversized_questions)
+                self.assertEqual(caught.exception.code, "provider_invalid_judgement")
+
+        # The real adapter boundary must convert huge JSON integers into its
+        # typed malformed-response error, never leak OverflowError.
+        wire_answers = batch_response()["answers"]
+        wire_answers["route"]["probabilities"]["reuse"] = huge
+        self.assert_code(
+            "provider_invalid_response",
+            lambda: self.call_batch(encode_batch_response(batch_response(answers=wire_answers))),
+        )
+
+        oversized_questions = batch_questions()
+        oversized_questions["route"]["instructions"] = "x" * 8193
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("abs_evolution.jev._execute_worker") as worker:
+                self.assert_code(
+                    "invalid_provider_request",
+                    lambda: JevJudge().judge_batch(
+                        state(),
+                        questions=oversized_questions,
+                        timeout_seconds=5,
+                        max_output_bytes=8192,
+                    ),
+                )
+                worker.assert_not_called()
+
+    def test_batch_parser_rejects_malformed_mixed_answers(self) -> None:
+        valid = batch_response()["answers"]
+        malformed: list[tuple[str, bytes]] = []
+
+        answers = copy.deepcopy(valid)
+        del answers["quality_opportunity"]
+        malformed.append(("missing_question_id", encode_batch_response(batch_response(answers=answers))))
+
+        answers = copy.deepcopy(valid)
+        answers["unexpected"] = {"type": "noul", "noul": 0.5}
+        malformed.append(("extra_question_id", encode_batch_response(batch_response(answers=answers))))
+
+        answers = copy.deepcopy(valid)
+        answers["route"] = {"type": "noul", "noul": 0.5}
+        malformed.append(("wrong_choice_type", encode_batch_response(batch_response(answers=answers))))
+
+        answers = copy.deepcopy(valid)
+        del answers["route"]["confidence"]
+        malformed.append(("wrong_choice_shape", encode_batch_response(batch_response(answers=answers))))
+
+        answers = copy.deepcopy(valid)
+        answers["has_regression"] = {
+            "type": "choice",
+            "choice": "true",
+            "probabilities": {"true": 1.0, "false": 0.0},
+            "confidence": 1.0,
+        }
+        malformed.append(("wrong_noul_type", encode_batch_response(batch_response(answers=answers))))
+
+        answers = copy.deepcopy(valid)
+        answers["has_regression"]["noul"] = True
+        malformed.append(("boolean_noul", encode_batch_response(batch_response(answers=answers))))
+
+        answers = copy.deepcopy(valid)
+        answers["has_regression"]["noul"] = 1.01
+        malformed.append(("out_of_range_noul", encode_batch_response(batch_response(answers=answers))))
+
+        answers = copy.deepcopy(valid)
+        answers["route"]["choice"] = "not-supplied"
+        malformed.append(("unsupplied_choice", encode_batch_response(batch_response(answers=answers))))
+
+        answers = copy.deepcopy(valid)
+        answers["route"]["probabilities"] = {"reuse": 0.2, "generate": 0.8}
+        malformed.append(("choice_not_highest", encode_batch_response(batch_response(answers=answers))))
+
+        nonfinite_noul = encode_batch_response().replace(b'"noul":0.03', b'"noul":1e999', 1)
+        malformed.append(("nonfinite_noul", nonfinite_noul))
+        malformed.append(("mismatched_model", encode_batch_response(batch_response(model="jev-1.14.0"))))
+
+        for name, body in malformed:
+            with self.subTest(name=name):
+                self.assert_code("provider_invalid_response", lambda body=body: self.call_batch(body))
+
+    def test_batch_request_schema_and_sensitive_material_fail_closed(self) -> None:
+        base = batch_questions()["route"]
+        too_many = {f"q{index}": copy.deepcopy(base) for index in range(9)}
+        malformed_questions = [
+            ("empty_batch", {}),
+            ("too_many_questions", too_many),
+            ("unsafe_id", {"not a safe id": copy.deepcopy(base)}),
+            ("non_string_id", {1: copy.deepcopy(base)}),
+            ("extra_question_field", {"route": {**copy.deepcopy(base), "extra": True}}),
+            ("missing_question_field", {"route": {"type": "choice", "instructions": "Choose."}}),
+            ("unsupported_question_type", {"route": {**copy.deepcopy(base), "type": "binary"}}),
+        ]
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": _TEST_KEY}, clear=True):
+            with mock.patch("abs_evolution.jev._execute_worker") as worker:
+                for name, questions in malformed_questions:
+                    with self.subTest(name=name):
+                        self.assert_code(
+                            "invalid_provider_request",
+                            lambda questions=questions: JevJudge().judge_batch(
+                                state(), questions=questions, timeout_seconds=5, max_output_bytes=8192,
+                            ),
+                        )
+
+                secret_state = state()
+                secret_state["request"]["password"] = "synthetic-password-value"
+                self.assert_code(
+                    "provider_sensitive_input",
+                    lambda: JevJudge().judge_batch(
+                        secret_state, questions=batch_questions(), timeout_seconds=5, max_output_bytes=8192,
+                    ),
+                )
+
+                configured_key_state = state()
+                configured_key_state["request"]["summary"] = _TEST_KEY
+                secret_error = self.assert_code(
+                    "provider_sensitive_input",
+                    lambda: JevJudge().judge_batch(
+                        configured_key_state, questions=batch_questions(), timeout_seconds=5, max_output_bytes=8192,
+                    ),
+                )
+                self.assertNotIn(_TEST_KEY, secret_error.message)
+                worker.assert_not_called()
+
+        raw_output_secret = encode_batch_response({**batch_response(), "metadata": "AKIA1234567890ABCDEF"})
+        self.assert_code("provider_sensitive_output", lambda: self.call_batch(raw_output_secret))
+
+        escaped_output_secret = encode_batch_response({**batch_response(), "metadata": _TEST_KEY})
+        encoded_key = "".join(f"\\u{ord(character):04x}" for character in _TEST_KEY).encode("ascii")
+        escaped_output_secret = escaped_output_secret.replace(_TEST_KEY.encode("ascii"), encoded_key)
+        self.assertNotIn(_TEST_KEY.encode("ascii"), escaped_output_secret)
+        self.assert_code("provider_sensitive_output", lambda: self.call_batch(escaped_output_secret))
+
+    def test_batch_timeout_rejects_late_worker_and_zeroes_credential_buffer(self) -> None:
+        observed: dict[str, bytearray | bytes] = {}
+
+        def late_worker(payload: bytearray, *, deadline: float, response_limit: int) -> bytes:
+            observed["buffer"] = payload
+            observed["before"] = bytes(payload)
+            time.sleep(0.03)
+            return b"OK\n" + encode_batch_response()
+
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": _TEST_KEY}, clear=True):
+            with mock.patch("abs_evolution.jev._execute_worker", side_effect=late_worker):
+                self.assert_code(
+                    "provider_timeout",
+                    lambda: JevJudge().judge_batch(
+                        state(), questions=batch_questions(), timeout_seconds=0.01, max_output_bytes=8192,
+                    ),
+                )
+
+        before = observed["before"]
+        buffer = observed["buffer"]
+        self.assertIsInstance(before, bytes)
+        self.assertIn(_TEST_KEY.encode("ascii"), before)
+        self.assertIsInstance(buffer, bytearray)
+        self.assertEqual(len(buffer), len(before))
+        self.assertEqual(buffer, bytearray(len(before)))
 
 
 class JevHttpWorkerTests(unittest.TestCase):

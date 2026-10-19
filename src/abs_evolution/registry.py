@@ -951,7 +951,8 @@ class Registry:
     @staticmethod
     def _validate_receipt(receipt: Any) -> tuple[str, str]:
         expected = {"id", "task_id", "snapshot_id", "outcome", "failure_tags", "evidence_refs"}
-        if not isinstance(receipt, dict) or set(receipt) != expected:
+        optional = {"task_family", "optimization_signals"}
+        if not isinstance(receipt, dict) or not expected.issubset(receipt) or set(receipt) - expected - optional:
             _error("invalid_receipt", "Receipt must contain exactly the documented fields")
         _validate_identifier(receipt["id"], "Receipt ID")
         _validate_identifier(receipt["task_id"], "Task ID")
@@ -971,6 +972,30 @@ class Registry:
             for item in receipt["evidence_refs"]
         ):
             _error("invalid_receipt", "Evidence references must be opaque identifiers, not URLs or paths")
+        if "task_family" in receipt and (
+            not isinstance(receipt["task_family"], str) or not _SAFE_TAG.fullmatch(receipt["task_family"])
+        ):
+            _error("invalid_receipt", "Task family must be a safe identifier")
+        if "optimization_signals" in receipt:
+            signals = receipt["optimization_signals"]
+            if not isinstance(signals, list) or len(signals) > 16:
+                _error("invalid_receipt", "Optimization signals must be a bounded list")
+            seen: set[tuple[str, str]] = set()
+            dimensions = {"quality", "efficiency", "method", "reuse"}
+            for signal in signals:
+                if not isinstance(signal, dict) or set(signal) != {"dimension", "tag"}:
+                    _error("invalid_receipt", "Each optimization signal must contain exactly dimension and tag")
+                dimension, tag = signal["dimension"], signal["tag"]
+                if not isinstance(dimension, str) or dimension not in dimensions:
+                    _error("invalid_receipt", "Optimization signal dimension is not supported")
+                if not isinstance(tag, str) or not _SAFE_TAG.fullmatch(tag):
+                    _error("invalid_receipt", "Optimization signal tag must be a safe identifier")
+                pair = (dimension, tag)
+                if pair in seen:
+                    _error("invalid_receipt", "Optimization signals must be unique by dimension and tag")
+                seen.add(pair)
+            if signals and ("task_family" not in receipt or not receipt["evidence_refs"]):
+                _error("invalid_receipt", "Optimization signals require task_family and evidence references")
         payload = _json(receipt, "invalid_receipt")
         return receipt["id"], payload
 

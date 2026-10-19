@@ -16,7 +16,14 @@ from ._jev_http import (
     MAX_WORKER_INPUT_BYTES,
 )
 from ._provider_transport import ProviderTransportError, run_bounded_worker
-from .contracts import ChoiceResult, canonical_json
+from .contracts import (
+    BatchJudgment,
+    ChoiceAnswer,
+    ChoiceResult,
+    NoulAnswer,
+    canonical_json,
+    validate_batch_judgment,
+)
 from .errors import EvolutionError
 from .provider_security import contains_sensitive_material
 from .providers import _strict_json_loads, _validate_call_limits, _validate_json_value
@@ -27,6 +34,9 @@ _MODEL_ID = re.compile(r"jev-[0-9]+\.[0-9]+\.[0-9]+\Z")
 _API_KEY = re.compile(r"[A-Za-z0-9._~-]{1,4096}\Z")
 _MAX_OBSERVED_TOKENS = 10_000_000
 _RESPONSE_METADATA_OVERHEAD = 64 * 1024
+_MAX_BATCH_QUESTIONS = 8
+_MAX_QUESTION_TEXT_BYTES = 8192
+_QUESTION_ID = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}\Z")
 
 
 def _raise(code: str, message: str) -> None:
@@ -44,6 +54,17 @@ def _read_api_key() -> str:
     if len(encoded) > MAX_API_KEY_BYTES or not _API_KEY.fullmatch(api_key):
         _raise("provider_credentials_invalid", "TypeSafe credential is not a valid token")
     return api_key
+
+
+def _validate_bounded_text(value: Any, *, field: str, max_bytes: int) -> None:
+    if type(value) is not str or not value.strip():
+        _raise("invalid_provider_request", f"{field} must be nonempty text")
+    try:
+        size = len(value.encode("utf-8", "strict"))
+    except UnicodeError:
+        _raise("invalid_provider_request", f"{field} must be valid UTF-8 text")
+    if size > max_bytes:
+        _raise("invalid_provider_request", f"{field} exceeds the bounded size")
 
 
 def _validate_inputs(
@@ -277,6 +298,131 @@ def _parse_response(
     )
 
 
+def _validate_batch_inputs(
+    state: Any,
+    questions: Any,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    if type(state) is not dict:
+        _raise("invalid_provider_request", "JEV state must be a JSON object")
+    try:
+        _validate_json_value(state, error_code="invalid_provider_request")
+    except (RecursionError, OverflowError):
+        _raise("invalid_provider_request", "JEV state must be finite bounded JSON")
+    if type(questions) is not dict or not 1 <= len(questions) <= _MAX_BATCH_QUESTIONS:
+        _raise("invalid_provider_request", "JEV batch must contain one to eight questions")
+    for question_id, question in questions.items():
+        if type(question_id) is not str or not _QUESTION_ID.fullmatch(question_id):
+            _raise("invalid_provider_request", "JEV question IDs must be safe bounded identifiers")
+        if type(question) is not dict or set(question) != {"type", "instructions", "criteria"}:
+            _raise("invalid_provider_request", "Each JEV question must contain exactly type, instructions, and criteria")
+        question_type = question["type"]
+        if type(question_type) is not str or question_type not in {"choice", "noul"}:
+            _raise("invalid_provider_request", "JEV batch question type must be Choice or Noul")
+        instructions = question["instructions"]
+        _validate_bounded_text(
+            instructions,
+            field="JEV question instructions",
+            max_bytes=_MAX_QUESTION_TEXT_BYTES,
+        )
+        criteria = question["criteria"]
+        if type(criteria) is not dict:
+            _raise("invalid_provider_request", "JEV question criteria must be an object")
+        if question_type == "choice":
+            if not 1 <= len(criteria) <= 255:
+                _raise("invalid_provider_request", "Choice criteria must contain one to 255 options")
+        elif set(criteria) != {"true", "false"}:
+            _raise("invalid_provider_request", "Noul criteria must define exactly true and false")
+        for option, description in criteria.items():
+            _validate_bounded_text(option, field="JEV criteria key", max_bytes=256)
+            _validate_bounded_text(
+                description,
+                field="JEV criteria text",
+                max_bytes=_MAX_QUESTION_TEXT_BYTES,
+            )
+    try:
+        _validate_json_value(questions, error_code="invalid_provider_request")
+        normalized_state = _strict_json_loads(canonical_json(state))
+        normalized_questions = _strict_json_loads(canonical_json(questions))
+    except EvolutionError:
+        raise
+    except (TypeError, ValueError, OverflowError, RecursionError, UnicodeError):
+        _raise("invalid_provider_request", "JEV batch request must be finite bounded JSON")
+    return normalized_state, normalized_questions
+
+
+def _build_batch_request_body(
+    model: str,
+    state: dict[str, Any],
+    questions: dict[str, dict[str, Any]],
+) -> tuple[str, bytes]:
+    request_value = {"model": model, "state": state, "questions": questions}
+    try:
+        request_text = canonical_json(request_value)
+        encoded = request_text.encode("utf-8", "strict")
+    except (TypeError, ValueError, OverflowError, RecursionError, UnicodeError):
+        _raise("invalid_provider_request", "JEV batch request could not be encoded safely")
+    if len(encoded) > MAX_BODY_BYTES:
+        _raise("provider_request_too_large", "JEV request exceeds the bounded input size")
+    return request_text, encoded
+
+
+def _parse_batch_response(
+    body: bytes,
+    *,
+    configured_api_key: str,
+    questions: dict[str, dict[str, Any]],
+    requested_model: str,
+) -> tuple[dict[str, ChoiceAnswer | NoulAnswer], str | None, int | None, int | None]:
+    try:
+        text = body.decode("utf-8", "strict")
+    except UnicodeError:
+        _raise("provider_invalid_response", "TypeSafe returned invalid UTF-8 JSON")
+    if contains_sensitive_material(text, configured_api_key):
+        _raise("provider_sensitive_output", "TypeSafe response contained credential-like material")
+    try:
+        response = _strict_json_loads(text)
+    except (ValueError, RecursionError):
+        _raise("provider_invalid_response", "TypeSafe returned invalid JSON")
+    if contains_sensitive_material(response, configured_api_key):
+        _raise("provider_sensitive_output", "TypeSafe response contained credential-like material")
+    try:
+        _validate_json_value(response, error_code="provider_invalid_response")
+    except (RecursionError, OverflowError):
+        _raise("provider_invalid_response", "TypeSafe response exceeds the structural limit")
+    if type(response) is not dict or set(response) - {"answers", "model", "usage"}:
+        _raise("provider_invalid_response", "TypeSafe returned an invalid batch response object")
+    answers = response.get("answers")
+    if type(answers) is not dict or set(answers) != set(questions):
+        _raise("provider_invalid_response", "TypeSafe answer IDs must exactly match the requested questions")
+
+    parsed: dict[str, ChoiceAnswer | NoulAnswer] = {}
+    for question_id, question in questions.items():
+        answer = answers[question_id]
+        if type(answer) is not dict:
+            _raise("provider_invalid_response", "TypeSafe returned an invalid typed answer")
+        if question["type"] == "choice":
+            if set(answer) != {"type", "choice", "probabilities", "confidence"} or answer["type"] != "choice":
+                _raise("provider_invalid_response", "TypeSafe returned an invalid Choice answer shape")
+            parsed[question_id] = ChoiceAnswer(
+                option=answer["choice"],
+                probabilities=answer["probabilities"],
+                confidence=answer["confidence"],
+            )
+        else:
+            if set(answer) != {"type", "noul"} or answer["type"] != "noul":
+                _raise("provider_invalid_response", "TypeSafe returned an invalid Noul answer shape")
+            parsed[question_id] = NoulAnswer(probability_yes=answer["noul"])
+
+    model = _observed_model(response.get("model"), requested_model)
+    usage = response.get("usage")
+    return (
+        parsed,
+        model,
+        _observed_tokens(usage, "input_tokens"),
+        _observed_tokens(usage, "output_tokens"),
+    )
+
+
 class JevJudge:
     """Request one fixed-endpoint TypeSafe Choice judgment.
 
@@ -381,6 +527,100 @@ class JevJudge:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
+        finally:
+            for index in range(len(worker_input)):
+                worker_input[index] = 0
+            del api_key
+
+    def judge_batch(
+        self,
+        state: dict[str, Any],
+        *,
+        questions: dict[str, dict[str, Any]],
+        timeout_seconds: float,
+        max_output_bytes: int,
+    ) -> BatchJudgment:
+        """Ask one bounded mixed Choice/Noul request and return typed answers."""
+        started = time.monotonic()
+        try:
+            timeout, output_limit = _validate_call_limits(timeout_seconds, max_output_bytes)
+        except OverflowError:
+            _raise("invalid_provider_limits", "Provider timeout must be positive and bounded")
+        deadline = started + timeout
+        normalized_state, normalized_questions = _validate_batch_inputs(state, questions)
+        request_text, request_bytes = _build_batch_request_body(
+            self.model,
+            normalized_state,
+            normalized_questions,
+        )
+        request_value = {
+            "state": normalized_state,
+            "questions": normalized_questions,
+        }
+        if contains_sensitive_material(request_value):
+            _raise("provider_sensitive_input", "Credential-like key material is not valid JEV input")
+        if time.monotonic() >= deadline:
+            _raise("provider_timeout", "TypeSafe request exceeded the provider deadline")
+
+        api_key = _read_api_key()
+        worker_input = bytearray()
+        try:
+            if api_key in request_text or contains_sensitive_material(request_value, api_key):
+                _raise("provider_sensitive_input", "Configured credential material is not valid JEV input")
+            response_limit = min(MAX_RESPONSE_BYTES, output_limit + _RESPONSE_METADATA_OVERHEAD)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _raise("provider_timeout", "TypeSafe request exceeded the provider deadline")
+            envelope = {
+                "api_key": api_key,
+                "body": request_bytes.decode("utf-8", "strict"),
+                "timeout_seconds": remaining,
+                "max_response_bytes": response_limit,
+            }
+            try:
+                worker_input.extend(canonical_json(envelope).encode("utf-8", "strict"))
+            except (TypeError, ValueError, OverflowError, RecursionError, UnicodeError):
+                _raise("invalid_provider_request", "TypeSafe worker request could not be encoded safely")
+            if len(worker_input) > MAX_WORKER_INPUT_BYTES:
+                _raise("provider_request_too_large", "TypeSafe worker input exceeds the bounded size limit")
+            del envelope
+
+            try:
+                wire = _execute_worker(
+                    worker_input,
+                    deadline=deadline,
+                    response_limit=response_limit,
+                )
+            finally:
+                for index in range(len(worker_input)):
+                    worker_input[index] = 0
+            if wire.startswith(b"ERR\n"):
+                _worker_error(wire)
+            if not wire.startswith(b"OK\n"):
+                _raise("provider_worker_error", "TypeSafe HTTP worker returned an invalid response")
+            answers, model, input_tokens, output_tokens = _parse_batch_response(
+                wire[3:],
+                configured_api_key=api_key,
+                questions=normalized_questions,
+                requested_model=self.model,
+            )
+            result = BatchJudgment(
+                answers=answers,
+                duration_seconds=max(0.0, time.monotonic() - started),
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+            try:
+                validate_batch_judgment(result, normalized_questions)
+            except EvolutionError as exc:
+                raise EvolutionError(
+                    "provider_invalid_response",
+                    "TypeSafe returned an invalid batch judgment",
+                ) from exc
+            if time.monotonic() >= deadline:
+                _raise("provider_timeout", "TypeSafe request exceeded the provider deadline")
+            return result
         finally:
             for index in range(len(worker_input)):
                 worker_input[index] = 0

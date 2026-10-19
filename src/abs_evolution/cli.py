@@ -41,27 +41,26 @@ def _provider_arguments(command: argparse.ArgumentParser) -> None:
                          help="Hybrid only: assert approval to send reviewed inputs to TypeSafe and any configured generator")
 
 
-def _read_candidate_pool(path: Path):
+def _read_reviewed_json(path: Path, *, limit: int, error_code: str, label: str):
     from .providers import _strict_json_loads
 
-    limit = 4 * 1024 * 1024
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK)
     except OSError as exc:
-        raise EvolutionError("invalid_candidate_pool", "Candidate pool must be an available regular file") from exc
+        raise EvolutionError(error_code, f"{label} must be an available regular file") from exc
     try:
         with os.fdopen(fd, "rb") as handle:
             metadata = os.fstat(handle.fileno())
             if not stat.S_ISREG(metadata.st_mode):
-                raise EvolutionError("invalid_candidate_pool", "Candidate pool must be a regular file")
+                raise EvolutionError(error_code, f"{label} must be a regular file")
             if metadata.st_size > limit:
-                raise EvolutionError("input_too_large", "Candidate pool exceeds the command limit")
+                raise EvolutionError("input_too_large", f"{label} exceeds the command limit")
             raw = handle.read(limit + 1)
         if len(raw) > limit:
-            raise EvolutionError("input_too_large", "Candidate pool exceeds the command limit")
+            raise EvolutionError("input_too_large", f"{label} exceeds the command limit")
         return _strict_json_loads(raw.decode("utf-8", "strict"))
     except (UnicodeError, ValueError, RecursionError, OSError) as exc:
-        raise EvolutionError("invalid_candidate_pool", "Candidate pool must contain bounded strict UTF-8 JSON") from exc
+        raise EvolutionError(error_code, f"{label} must contain bounded strict UTF-8 JSON") from exc
 
 
 def _proposal_provider(args: argparse.Namespace):
@@ -82,7 +81,10 @@ def _proposal_provider(args: argparse.Namespace):
             raise EvolutionError("invalid_arguments", "A completion-token cap requires a configured --model")
         from .hybrid import HybridProposalProvider
         from .jev import JevJudge
-        candidates = _read_candidate_pool(args.candidate_pool) if args.candidate_pool is not None else []
+        candidates = _read_reviewed_json(
+            args.candidate_pool, limit=4 * 1024 * 1024,
+            error_code="invalid_candidate_pool", label="Candidate pool",
+        ) if args.candidate_pool is not None else []
         generator = None
         if args.model:
             from .openrouter import OpenRouterProvider
@@ -164,9 +166,31 @@ def parser() -> argparse.ArgumentParser:
     record.add_argument("file", type=Path)
     receipt_list = receipts.add_parser("list")
     receipt_list.add_argument("--limit", type=int, default=100)
-    opportunities = commands.add_parser("opportunities", help="Find repeated failure tags for investigation")
+    opportunities = commands.add_parser(
+        "opportunities", help="Summarize repeated failure and explicit optimization signals for comparison"
+    )
     opportunities.add_argument("--min-occurrences", type=int, default=2)
     opportunities.add_argument("--limit", type=int, default=1000)
+
+    classify = commands.add_parser("classify", help="Use JEV to classify one reviewed optimization observation")
+    classify.add_argument("--request", type=Path, required=True)
+    classify.add_argument("--allow-external", action="store_true",
+                          help="Assert approval to send this reviewed request to TypeSafe")
+    classify.add_argument("--jev-model", default="jev-1.13.0")
+    classify.add_argument("--min-choice-confidence", type=float, default=0.8)
+    classify.add_argument("--min-choice-probability", type=float, default=0.8)
+    classify.add_argument("--timeout-seconds", type=float, default=30)
+    classify.add_argument("--max-output-bytes", type=int, default=65536)
+
+    assess = commands.add_parser("assess", help="Experimentally judge opportunity presence and four independent directions")
+    assess.add_argument("--request", type=Path, required=True)
+    assess.add_argument("--allow-external", action="store_true",
+                        help="Assert approval to send this reviewed request to TypeSafe")
+    assess.add_argument("--jev-model", default="jev-1.13.0")
+    assess.add_argument("--min-choice-confidence", type=float, default=0.8)
+    assess.add_argument("--min-choice-probability", type=float, default=0.8)
+    assess.add_argument("--timeout-seconds", type=float, default=30)
+    assess.add_argument("--max-output-bytes", type=int, default=65536)
 
     policies = commands.add_parser("policy").add_subparsers(dest="action", required=True)
     policies.add_parser("show")
@@ -203,6 +227,40 @@ def _execution_sandbox(name: str):
 
 
 def dispatch(args: argparse.Namespace):
+    if args.command == "assess":
+        if not args.allow_external:
+            raise EvolutionError("provider_blocked_external_not_allowed", "Assessment requires --allow-external for the reviewed request")
+        from .jev import JevJudge
+        from .opportunity_judgment import MAX_REQUEST_BYTES
+        from .opportunity_assessment import OpportunityAssessment
+
+        request = _read_reviewed_json(
+            args.request, limit=MAX_REQUEST_BYTES,
+            error_code="invalid_opportunity_request", label="Opportunity request",
+        )
+        return OpportunityAssessment(
+            JevJudge(model=args.jev_model),
+            min_confidence=args.min_choice_confidence,
+            min_probability=args.min_choice_probability,
+        ).assess(request, timeout_seconds=args.timeout_seconds, max_output_bytes=args.max_output_bytes)
+    if args.command == "classify":
+        if not args.allow_external:
+            raise EvolutionError(
+                "provider_blocked_external_not_allowed",
+                "JEV classification requires --allow-external for the reviewed request",
+            )
+        from .jev import JevJudge
+        from .opportunity_judgment import MAX_REQUEST_BYTES, OpportunityJudge
+
+        request = _read_reviewed_json(
+            args.request, limit=MAX_REQUEST_BYTES,
+            error_code="invalid_opportunity_request", label="Opportunity request",
+        )
+        return OpportunityJudge(
+            JevJudge(model=args.jev_model),
+            min_confidence=args.min_choice_confidence,
+            min_probability=args.min_choice_probability,
+        ).assess(request, timeout_seconds=args.timeout_seconds, max_output_bytes=args.max_output_bytes)
     if args.command == "propose":
         provider = _proposal_provider(args)
         proposal = provider.propose(

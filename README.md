@@ -1,9 +1,91 @@
 # ABS Evolution
 
-An independent local experiment engine for ABS. It learns from explicitly
-submitted task receipts, proposes bounded changes, runs candidate programs in
-an OS sandbox, and selects versions using separate training and acceptance
-evidence. It does not install or update the ABS plugin.
+An evidence-constrained continuous optimization engine for ABS. Explicit task
+receipts can identify opportunities in quality, efficiency, methods and reuse,
+including after successful tasks. Failures are one source of evidence, not a
+prerequisite for improvement. The engine proposes bounded changes, runs candidate
+programs in an OS sandbox, and selects versions using separate training and
+acceptance evidence. It does not install or update the ABS plugin.
+
+## Optimization goal
+
+Define the desired outcome, observe the current version, propose an alternative,
+compare both on independent cases, then retain a version with demonstrated gains.
+Actual task adoption and continued measurement follow separately. A successful
+task can still take unnecessary steps, cost too much, or reveal a reusable method.
+
+Define "better" before generating candidates. Examples are lower measured cost
+at unchanged quality, or better quality within the same budget. Authorization,
+isolation and safety requirements are hard constraints, never weighted tradeoffs.
+An observation starts an investigation; it does not prove that an alternative is
+better or authorize a change to shared instructions.
+
+The current executable evaluator measures exact JSON correctness only. It cannot
+yet accept a same-quality candidate on cost or latency savings. Those objectives
+need trusted measurements and corresponding promotion checks. Do not lower the
+quality-gain threshold to present an unmeasured efficiency claim as a result.
+
+## Semantic judgments use JEV
+
+JEV owns semantic classification and proposal-route selection. Code owns exact
+validation, counting, deadlines, budgets, permissions and evidence gates. A
+generator writes proposed changes only when the selected route requires them.
+Independent evaluation, not JEV's confidence, establishes measured gains.
+
+Use `classify` for an observation that needs semantic interpretation. It sends
+one reviewed request to JEV and selects a primary comparison hypothesis in
+quality, efficiency, method or reuse. It can also return no supported opportunity,
+insufficient evidence, or a deferred uncertain result. Success does not prevent
+optimization; unknown task outcomes remain unknown.
+
+```sh
+PYTHONPATH=src python3 -m abs_evolution classify --request examples/optimization/request.json --allow-external
+```
+
+This command requires `TYPESAFE_API_KEY` in the process environment. It is a live
+model command, not a dry run. The bundled input is synthetic; real inputs need
+TypeSafe-specific sharing approval and reviewed, minimized evidence summaries.
+Do not include transcripts, credentials, personal data or protected holdout cases.
+The command does not read registry history or retrieve evidence on its own.
+
+The output retains the Choice distribution, observed model/token usage, request
+and judgment fingerprints, and opaque evidence references. It omits raw input
+text. Confidence and selected probability thresholds default to 0.8 and remain
+provisional; ties or low confidence defer without another model or heuristic
+fallback. A service error is an error, not a negative classification.
+
+`next_step` is advisory. No result creates a receipt, runs a candidate, changes a
+channel or grants permission. `receipt record` preserves explicit supplied
+observations; `opportunities` only aggregates them. Use `classify` when their
+meaning needs judgment. Neither command silently infers labels from tag names.
+The existing `hybrid` route below uses JEV to select reuse, generation or
+insufficient evidence. Both stages follow TypeSafe's
+[Choice](https://docs.typesafe.ai/primitives/choice) and
+[confidence](https://docs.typesafe.ai/confidence) contracts.
+
+For an experimental, non-exclusive assessment, use `assess` with the same reviewed
+request. It leaves `classify` and the hybrid route unchanged:
+
+```sh
+PYTHONPATH=src python3 -m abs_evolution assess --request examples/optimization/request.json --allow-external
+```
+
+One API request contains a three-way Choice about whether an opportunity is worth
+comparing, plus four independent [Noul](https://docs.typesafe.ai/primitives/noul)
+questions for quality, efficiency, method and reuse. Several directions can be
+supported together. Each Noul value is a probability of yes, not a gain estimate,
+and the four values do not sum to one. Values at or above 0.8 are supported, at or
+below 0.2 are not supported, and the middle remains uncertain. These thresholds
+are provisional; the presence Choice retains the default 0.8 confidence and
+probability gates. Uncertain presence never becomes a recommendation to compare
+just because one direction is high. Conflicting confident answers defer for review.
+Raw typed answers remain visible even when the combined assessment defers.
+
+The same external-sharing opt-in, input limits and no-write boundaries apply.
+Usage is recorded once for the entire batch. Changing from a six-way Choice to
+separate questions changes the judgment being measured: higher values alone do
+not establish better accuracy. Use fixed inputs, a pinned model and a predeclared
+call budget when comparing question designs; evaluate correctness independently.
 
 ## Scope
 
@@ -49,6 +131,8 @@ unrelated content. No daemon or scheduled task is installed.
 The files under `examples/acceptance/` deliberately model the difference between
 an execution observation and an accepted outcome. The baseline incorrectly
 accepts any nonempty evidence list. A reviewed fixture proposal repairs it.
+This remains a useful correctness regression, not a requirement that every
+optimization begin with a defect.
 
 ```sh
 PYTHONPATH=src python3 -m abs_evolution --state /absolute/path/to/new-state init
@@ -240,25 +324,37 @@ security checks must still stop protected actions when they fail.
 
 ## Opt-in experience
 
-Submit compact receipts with `receipt record FILE.json`. The schema is limited
-to identifiers, accepted/failed/unknown outcome, failure tags and opaque evidence
-references. Unknown outcomes are not counted as successful tasks. Raw messages,
-arbitrary metadata, URLs and local paths are not receipt fields.
+Submit compact receipts with `receipt record FILE.json`. Keep the existing
+outcome, failure tags and opaque evidence references. Optional `task_family`
+and `optimization_signals` describe explicit observations from any outcome.
+Each signal has a dimension of `quality`, `efficiency`, `method` or `reuse`, and
+a safe identifier tag. Nonempty signals require a task family and evidence
+references. No signal is inferred merely because a task succeeded or failed.
+Unknown outcomes remain unknown. Raw messages, arbitrary metadata, URLs and
+local paths are not receipt fields.
 
 ```json
 {
   "id": "receipt-001",
   "task_id": "report-123",
   "snapshot_id": "REPLACE_WITH_THE_PINNED_SNAPSHOT_ID",
-  "outcome": "failed",
-  "failure_tags": ["premature_acceptance"],
+  "outcome": "accepted",
+  "failure_tags": [],
+  "task_family": "source-backed-summary",
+  "optimization_signals": [
+    {"dimension": "efficiency", "tag": "repeated_source_reads"}
+  ],
   "evidence_refs": ["evidence-001"]
 }
 ```
 
-`opportunities` groups repeated failures from distinct tasks and preserves their
-evidence references. Its results are investigation candidates, not causal
-diagnoses or permission to change every task's shared instructions.
+`opportunities` groups matching signals across distinct tasks within the same
+family and dimension, preserving versions, receipts, evidence references and
+observed outcomes. Two receipts from one task do not satisfy the default
+two-task threshold. Accepted tasks can produce `needs_comparison` opportunities;
+their observations are not measured gains. Legacy failure-only receipts remain
+valid and produce `needs_investigation` results. The command is read-only and
+does not start experiments, invoke a model or promote a version.
 
 ## Trust and evidence boundaries
 

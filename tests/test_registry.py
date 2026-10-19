@@ -281,6 +281,23 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(len(self.registry.list_receipts()), 1)
         self.assertEqual(self.registry.list_receipts()[0], receipt)
 
+        signal_receipt = {
+            **receipt, "id": "receipt-signal", "outcome": "accepted", "failure_tags": [],
+            "task_family": "support", "optimization_signals": [
+                {"dimension": "efficiency", "tag": "fewer_steps"},
+                {"dimension": "reuse", "tag": "fewer_steps"},
+            ],
+        }
+        self.assertTrue(self.registry.record_receipt(signal_receipt)["created"])
+        reopened = Registry(self.root)
+        self.assertEqual(reopened.record_receipt(signal_receipt)["created"], False)
+        self.assertEqual(next(item for item in reopened.list_receipts() if item["id"] == "receipt-signal"),
+                         signal_receipt)
+        empty_signals = {**receipt, "id": "receipt-empty-signals", "optimization_signals": []}
+        self.assertTrue(reopened.record_receipt(empty_signals)["created"])
+        self.assertEqual(next(item for item in reopened.list_receipts()
+                              if item["id"] == "receipt-empty-signals"), empty_signals)
+
         conflict = {**receipt, "outcome": "failed"}
         self.assert_code("receipt_id_conflict", lambda: self.registry.record_receipt(conflict))
         self.assert_code(
@@ -291,6 +308,25 @@ class RegistryTests(unittest.TestCase):
             "invalid_receipt",
             lambda: self.registry.record_receipt({**receipt, "unexpected": "field"}),
         )
+        valid_signal = {**receipt, "task_family": "support", "optimization_signals": [
+            {"dimension": "quality", "tag": "clearer"}
+        ]}
+        invalid_signals = [
+            {**valid_signal, "optimization_signals": "quality"},
+            {**valid_signal, "optimization_signals": [{"dimension": "other", "tag": "clearer"}]},
+            {**valid_signal, "optimization_signals": [{"dimension": "quality", "tag": "bad tag"}]},
+            {**valid_signal, "optimization_signals": [{"dimension": "quality", "tag": "clearer", "extra": 1}]},
+            {**valid_signal, "optimization_signals": [{"dimension": "quality", "tag": "clearer"}] * 2},
+            {**valid_signal, "optimization_signals": [
+                {"dimension": "quality", "tag": "tag"}
+            ] * 17},
+            {**receipt, "task_family": "not safe"},
+            {**receipt, "optimization_signals": [{"dimension": "reuse", "tag": "x"}]},
+            {**valid_signal, "evidence_refs": []},
+        ]
+        for invalid in invalid_signals:
+            with self.subTest(receipt=invalid):
+                self.assert_code("invalid_receipt", lambda invalid=invalid: self.registry.record_receipt(invalid))
 
     def test_foreground_and_daily_budget_denials_do_not_reassign_claims(self) -> None:
         constrained = Policy(

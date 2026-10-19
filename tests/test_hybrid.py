@@ -161,6 +161,26 @@ class HybridProposalProviderTests(unittest.TestCase):
         self.assertNotIn("proposal", trace)
         self.assertNotIn("input", trace)
 
+        # A passing task can still have a stated continuous-improvement goal.
+        # The stubbed typed choice exercises the reuse path only; it does not
+        # establish that a live model interpreted the rubric correctly.
+        successful_request = request()
+        successful_request["objective"] = "Explore a quality and efficiency improvement for this successful task."
+        for example in successful_request["training_examples"]:
+            example["expected"] = copy.deepcopy(example["actual"])
+            example["passed"] = True
+        optimization_provider, optimization_judge = self.make(
+            "reuse_known-fix", candidates=[candidate], generator=generator,
+        )
+        optimized = optimization_provider.propose(
+            successful_request, timeout_seconds=3, max_output_bytes=8192,
+        )
+        self.assertTrue(all(item["passed"] for item in successful_request["training_examples"]))
+        self.assertEqual(optimized.value, candidate["proposal"])
+        self.assertEqual(validated_routing(optimized.routing)["route"], "reuse")
+        self.assertEqual(generator.calls, [])
+        self.assertEqual(len(optimization_judge.calls), 1)
+
     def test_confident_generate_calls_generator_once_with_original_request_and_remaining_budget(self) -> None:
         req = request()
         original = copy.deepcopy(req)
@@ -331,7 +351,6 @@ class HybridProposalProviderTests(unittest.TestCase):
                 self.assertEqual(judge.calls, [])
 
     def test_routing_serialization_rejects_unbounded_or_inconsistent_metadata(self) -> None:
-        provider, _judge = self.make("generate", generator=RecordingGenerator())
         provider, _judge = self.make("generate", generator=RecordingGenerator())
         result = provider.propose(request(), timeout_seconds=2, max_output_bytes=8192)
         trace = validated_routing(result.routing)
