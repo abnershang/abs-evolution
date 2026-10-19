@@ -198,7 +198,7 @@ class DockerSandboxRuntimeTests(unittest.TestCase):
         before = self._owned_container_ids()
         result = self._run(
             """
-            import errno, json, os, signal
+            import errno, json, os, signal, time
             def fill(root, limit):
                 written = 0
                 try:
@@ -218,6 +218,7 @@ class DockerSandboxRuntimeTests(unittest.TestCase):
                         denied = exc.errno == errno.EAGAIN
                         break
                     if pid == 0:
+                        time.sleep(30)
                         os._exit(0)
                     children.append(pid)
                 print(json.dumps({
@@ -227,6 +228,12 @@ class DockerSandboxRuntimeTests(unittest.TestCase):
                 }, sort_keys=True))
             finally:
                 for pid in children:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ChildProcessError:
+                        pass
+                    except ProcessLookupError:
+                        pass
                     try:
                         os.waitpid(pid, 0)
                     except ChildProcessError:
@@ -251,7 +258,7 @@ class DockerSandboxRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "failed", result)
-        self.assertIn("memory limit", result.reason or "")
+        self.assertEqual(result.returncode, 137)
         self._assert_no_owned_container_leak(before)
 
     def test_combined_output_limit_is_enforced_and_container_is_removed(self) -> None:

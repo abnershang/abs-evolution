@@ -210,10 +210,30 @@ while time.monotonic() < end:
 assert int(stats()['nr_throttled']) > before, 'CPU quota did not throttle'
 '''
 
-_MEMORY_PROBE = r'''blocks = []
-for _ in range(256):
-    blocks.append(bytearray(1024 * 1024))
-raise AssertionError('memory limit did not terminate the process')
+_MEMORY_PROBE = r'''import os, signal, sys
+from pathlib import Path
+cgroup = Path('/sys/fs/cgroup')
+if (cgroup / 'memory.max').read_text().strip() != str(64 * 1024 * 1024):
+    raise AssertionError('unexpected memory.max')
+def events():
+    return {
+        key: int(value)
+        for key, value in (line.split() for line in (cgroup / 'memory.events').read_text().splitlines())
+    }
+before = events()
+pid = os.fork()
+if pid == 0:
+    blocks = []
+    for _ in range(256):
+        blocks.append(bytearray(1024 * 1024))
+    os._exit(42)
+_, status = os.waitpid(pid, 0)
+after = events()
+if not os.WIFSIGNALED(status) or os.WTERMSIG(status) != signal.SIGKILL:
+    raise AssertionError('memory-limit child was not killed')
+if any(after.get(key, 0) - before.get(key, 0) <= 0 for key in ('max', 'oom', 'oom_kill')):
+    raise AssertionError('memory.events did not confirm a kernel OOM kill')
+sys.stdout.write('kernel-oom-verified\n')
 '''
 
 _PIDS_PROBE = r'''import errno, os, signal, time
@@ -498,11 +518,11 @@ class DockerSandbox:
             or attach_returncode != container_state.get("ExitCode")
         ):
             return ProcessResult("blocked", None, stdout_text, stderr_text, duration, "Docker attach did not confirm a terminal container exit")
-        if container_state.get("OOMKilled") is True:
-            return ProcessResult("failed", 137, stdout_text, stderr_text, duration, "candidate exceeded the enforced memory limit")
         returncode = container_state.get("ExitCode")
         if type(returncode) is not int:
             return ProcessResult("blocked", None, stdout_text, stderr_text, duration, "Docker returned an invalid container exit status")
+        if container_state.get("OOMKilled") is True:
+            return ProcessResult("failed", returncode, stdout_text, stderr_text, duration, "Docker reported an OOM in the candidate container")
         if b"ABS_SANDBOX_ADMISSION_FAILED" in stderr_buffer:
             return ProcessResult("blocked", returncode, stdout_text, stderr_text, duration, "effective Docker isolation check failed")
         if returncode == 0:
@@ -743,7 +763,7 @@ class DockerSandbox:
             (_CONTROL_AND_SCRATCH_PROBE, "normal"),
             (_CPU_PROBE, "normal"),
             (_PIDS_PROBE, "normal"),
-            (_MEMORY_PROBE, "oom"),
+            (_MEMORY_PROBE, "kernel_oom"),
         )
         for source, expected in probes:
             remaining = self._capability_deadline - time.monotonic()
@@ -786,8 +806,13 @@ class DockerSandbox:
                         )
                         if expected == "normal":
                             ok = terminal and state.get("ExitCode") == 0 and state.get("OOMKilled") is False
-                        elif expected == "oom":
-                            ok = terminal and state.get("ExitCode") == 137 and state.get("OOMKilled") is True
+                        elif expected == "kernel_oom":
+                            ok = (
+                                terminal
+                                and state.get("ExitCode") == 0
+                                and start.stdout == "kernel-oom-verified\n"
+                                and start.stderr == ""
+                            )
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
             ok = False
         if not self._cleanup_container(

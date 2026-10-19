@@ -25,7 +25,7 @@ def docker(*args: str, timeout: float = 30) -> subprocess.CompletedProcess[str]:
     )
 
 
-def probe(label: str, code: str, *, oom: bool = False, deadline: bool = False) -> None:
+def probe(label: str, code: str, *, kernel_oom: bool = False, deadline: bool = False) -> None:
     name = "abs-limits-" + uuid.uuid4().hex
     created = False
     try:
@@ -41,19 +41,17 @@ def probe(label: str, code: str, *, oom: bool = False, deadline: bool = False) -
         )
         created = True
         timed_out = False
+        output = ""
         try:
-            docker("start", "--attach", name, timeout=3 if deadline else 20)
+            output = docker("start", "--attach", name, timeout=3 if deadline else 20).stdout
         except subprocess.TimeoutExpired:
             timed_out = True
             docker("kill", name)
-        except subprocess.CalledProcessError:
-            if not oom:
-                raise
         state = json.loads(docker("inspect", "--format={{json .State}}", name).stdout)
         if deadline:
             assert timed_out and not state["Running"] and state["ExitCode"] == 137, state
-        elif oom:
-            assert not timed_out and state["OOMKilled"] and state["ExitCode"] == 137, state
+        elif kernel_oom:
+            assert not timed_out and state["ExitCode"] == 0 and output.strip() == "kernel-oom-verified", state
         else:
             assert not timed_out and state["ExitCode"] == 0 and not state["OOMKilled"], state
     finally:
@@ -121,11 +119,24 @@ def main() -> None:
             assert 0 < written <= limit, written
     """)
     probe("hard-memory-oom", """
-        blocks = []
-        for _ in range(256):
-            blocks.append(bytearray(1024*1024))
-        raise AssertionError('memory limit did not kill the process')
-    """, oom=True)
+        import os, signal
+        from pathlib import Path
+        cgroup = Path('/sys/fs/cgroup')
+        assert (cgroup / 'memory.max').read_text().strip() == str(64*1024*1024)
+        def events():
+            return {key: int(value) for key, value in
+                    (line.split() for line in (cgroup / 'memory.events').read_text().splitlines())}
+        before = events()
+        child = os.fork()
+        if child == 0:
+            blocks = [bytearray(1024*1024) for _ in range(256)]
+            os._exit(1)
+        _, status = os.waitpid(child, 0)
+        after = events()
+        assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL, status
+        assert all(after[key] > before[key] for key in ('max', 'oom', 'oom_kill')), (before, after)
+        print('kernel-oom-verified')
+    """, kernel_oom=True)
     probe("process-count", """
         import errno, os, signal, time
         children = []

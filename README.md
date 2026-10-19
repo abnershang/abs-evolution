@@ -314,6 +314,10 @@ started. No arbitrary candidate source is accepted by this probe script.
 The limits follow Docker's [resource constraints](https://docs.docker.com/engine/containers/resource_constraints/)
 and [tmpfs semantics](https://docs.docker.com/engine/storage/tmpfs/); tmpfs memory
 also counts toward the container memory ceiling.
+The trusted memory probe observes a killed allocation child and positive
+`max`, `oom` and `oom_kill` deltas in the container's
+[kernel memory events](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory).
+Exit code 137 or Docker's `OOMKilled` field alone is not the admission proof.
 
 The same job then tests the actual Docker backend and runs the public CLI
 through offline evaluation, explicit promotion, execution of pinned old/new
