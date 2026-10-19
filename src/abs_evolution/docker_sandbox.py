@@ -388,7 +388,7 @@ class DockerSandbox:
             if image.get("Os") != "linux" or image.get("Architecture") != IMAGE_ARCH:
                 raise RuntimeError("Pinned Python image must be Linux/amd64")
             if not self._run_capability_probes():
-                raise RuntimeError("Docker did not pass every fixed resource-isolation probe")
+                raise RuntimeError(self._capability_reason)
             self._capability_reason = "Linux cgroup v2 Docker runtime passed bounded resource-isolation probes"
             self._capability = True
             return True
@@ -712,7 +712,8 @@ class DockerSandbox:
             config = record["Config"]
             host = record["HostConfig"]
             labels = config["Labels"]
-            if labels.get(_OWNER_LABEL) != owner or config.get("Image") != IMAGE:
+            image_names = {IMAGE, IMAGE.removeprefix("docker.io/"), IMAGE.removeprefix("docker.io/library/")}
+            if labels.get(_OWNER_LABEL) != owner or config.get("Image") not in image_names:
                 return False
             if config.get("User") != "65534:65534" or not config.get("OpenStdin"):
                 return False
@@ -728,7 +729,7 @@ class DockerSandbox:
                 return False
             if host.get("CapDrop") != ["ALL"]:
                 return False
-            if not set(host.get("SecurityOpt") or []).intersection({"no-new-privileges", "no-new-privileges:true"}):
+            if not set(host.get("SecurityOpt") or []).intersection({"no-new-privileges", "no-new-privileges:true", "no-new-privileges=true"}):
                 return False
             if host.get("PidMode") not in ("", "private") or host.get("IpcMode") not in ("", "private"):
                 return False
@@ -765,7 +766,8 @@ class DockerSandbox:
             (_PIDS_PROBE, "normal"),
             (_MEMORY_PROBE, "kernel_oom"),
         )
-        for source, expected in probes:
+        for index, (source, expected) in enumerate(probes, 1):
+            self._capability_reason = f"Docker resource probe {index} did not complete"
             remaining = self._capability_deadline - time.monotonic()
             if remaining <= 0 or not self._run_capability_probe(source, expected=expected, timeout=remaining):
                 return False
@@ -781,6 +783,8 @@ class DockerSandbox:
                 self._base_create_args(name, owner, [PYTHON, "-I", "-S", "-c", source], snapshot=None),
                 timeout=min(CAPABILITY_COMMAND_TIMEOUT_SECONDS, timeout, self._cap_timeout()),
             )
+            if create.returncode != 0:
+                self._capability_reason = "Fixed probe container creation failed: " + create.stderr[-512:]
             if create.returncode == 0 and _HEX_ID.fullmatch(create.stdout.strip()):
                 container_id = create.stdout.strip()
                 inspect_status, record = self._inspect(
@@ -813,6 +817,22 @@ class DockerSandbox:
                                 and start.stdout == "kernel-oom-verified\n"
                                 and start.stderr == ""
                             )
+                        if not ok:
+                            self._capability_reason = (
+                                f"Fixed {expected} probe failed with exit {state.get('ExitCode')}: "
+                                + start.stderr[-512:]
+                            )
+                elif record is not None:
+                    # Only trusted fixed-probe settings, never candidate data or environment.
+                    host = record.get("HostConfig", {})
+                    detail = {key: host.get(key) for key in (
+                        "Memory", "MemorySwap", "PidsLimit", "ShmSize", "NanoCpus",
+                        "ReadonlyRootfs", "NetworkMode", "Privileged", "OomKillDisable",
+                        "CapDrop", "SecurityOpt", "PidMode", "IpcMode", "CgroupnsMode",
+                        "LogConfig", "Tmpfs",
+                    )}
+                    detail["Image"] = record.get("Config", {}).get("Image")
+                    self._capability_reason = "Fixed probe configuration rejected: " + json.dumps(detail)[:2048]
         except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired):
             ok = False
         if not self._cleanup_container(
