@@ -35,6 +35,173 @@ class ChoiceResult:
     output_tokens: int | None = None
 
 
+def validate_choice_result(choice: ChoiceResult, expected_options: set[str]) -> None:
+    """Validate a typed judge result before any caller consumes its decision."""
+    def invalid(message: str) -> None:
+        raise EvolutionError("provider_invalid_judgement", message)
+
+    if not isinstance(choice, ChoiceResult):
+        invalid("JEV returned an unsupported typed-choice result")
+    if not isinstance(choice.option, str) or choice.option not in expected_options:
+        invalid("JEV selected an option that was not supplied")
+    probabilities = choice.probabilities
+    if not isinstance(probabilities, dict) or set(probabilities) != expected_options:
+        invalid("JEV probabilities must cover every supplied option exactly")
+    checked: list[float] = []
+    for probability in probabilities.values():
+        if isinstance(probability, bool) or not isinstance(probability, (float, int)) or not 0 <= probability <= 1 or not math.isfinite(probability):
+            invalid("JEV probabilities must be finite and bounded")
+        checked.append(float(probability))
+    if abs(math.fsum(checked) - 1.0) > 1e-6:
+        invalid("JEV probabilities must sum to one")
+    if probabilities[choice.option] != max(checked):
+        invalid("JEV choice must have the highest probability")
+    if isinstance(choice.confidence, bool) or not isinstance(choice.confidence, (float, int)) or not 0 <= choice.confidence <= 1 or not math.isfinite(choice.confidence):
+        invalid("JEV confidence must be finite and bounded")
+    if isinstance(choice.duration_seconds, bool) or not isinstance(choice.duration_seconds, (float, int)) or not 0 <= choice.duration_seconds <= 3600 or not math.isfinite(choice.duration_seconds):
+        invalid("JEV duration must be finite and bounded")
+    if choice.model is not None and (
+        not isinstance(choice.model, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}", choice.model)
+    ):
+        invalid("JEV model metadata is invalid")
+    for field, value in (("input_tokens", choice.input_tokens), ("output_tokens", choice.output_tokens)):
+        if value is not None and (type(value) is not int or not 0 <= value <= 10_000_000):
+            invalid(f"JEV {field} metadata is invalid")
+
+
+@dataclass(frozen=True)
+class ChoiceAnswer:
+    option: str
+    probabilities: dict[str, float]
+    confidence: float
+
+
+@dataclass(frozen=True)
+class NoulAnswer:
+    probability_yes: float
+
+
+@dataclass(frozen=True)
+class BatchJudgment:
+    answers: dict[str, ChoiceAnswer | NoulAnswer]
+    duration_seconds: float
+    model: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+def validate_batch_judgment(
+    result: BatchJudgment,
+    questions: dict[str, dict[str, Any]],
+) -> None:
+    """Validate one typed result against every requested Choice or Noul question."""
+    def invalid(message: str) -> None:
+        raise EvolutionError("provider_invalid_judgement", message)
+
+    def bounded_text(value: Any, field: str) -> None:
+        if type(value) is not str or not value.strip():
+            invalid(f"{field} must be nonempty text")
+        try:
+            size = len(value.encode("utf-8", "strict"))
+        except UnicodeError:
+            invalid(f"{field} must be bounded UTF-8 text")
+        if size > 8192:
+            invalid(f"{field} must be bounded UTF-8 text")
+
+    if type(result) is not BatchJudgment:
+        invalid("JEV returned an unsupported batch judgment")
+    if type(questions) is not dict or not 1 <= len(questions) <= 8:
+        invalid("Batch questions must contain one to eight entries")
+    for question_id, question in questions.items():
+        if (
+            type(question_id) is not str
+            or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", question_id)
+            or type(question) is not dict
+            or set(question) != {"type", "instructions", "criteria"}
+        ):
+            invalid("Batch question IDs and shapes must match the supported schema")
+        if type(question["type"]) is not str or question["type"] not in {"choice", "noul"}:
+            invalid("Batch question type is unsupported")
+        bounded_text(question["instructions"], "Question instructions")
+        criteria = question["criteria"]
+        if type(criteria) is not dict:
+            invalid("Question criteria must be an object")
+        if question["type"] == "choice":
+            if not 1 <= len(criteria) <= 255:
+                invalid("Choice criteria must contain one to 255 options")
+        elif set(criteria) != {"true", "false"}:
+            invalid("Noul criteria must define exactly true and false")
+        for key, rubric in criteria.items():
+            if type(key) is not str or not key.strip():
+                invalid("Question criteria keys must be bounded text")
+            try:
+                if len(key.encode("utf-8", "strict")) > 256:
+                    invalid("Question criteria keys must be bounded text")
+            except UnicodeError:
+                invalid("Question criteria keys must be bounded UTF-8 text")
+            bounded_text(rubric, "Question criteria")
+
+    answers = result.answers
+    if type(answers) is not dict or set(answers) != set(questions):
+        invalid("JEV answer IDs must exactly match the requested question IDs")
+    for question_id, question in questions.items():
+        answer = answers[question_id]
+        criteria = question["criteria"]
+        if question["type"] == "choice":
+            if type(answer) is not ChoiceAnswer:
+                invalid("Choice questions require ChoiceAnswer results")
+            if type(answer.option) is not str or answer.option not in criteria:
+                invalid("Choice answer must select one supplied option")
+            probabilities = answer.probabilities
+            if type(probabilities) is not dict or set(probabilities) != set(criteria):
+                invalid("Choice probabilities must cover every supplied option exactly")
+            checked: list[float] = []
+            for probability in probabilities.values():
+                if (
+                    isinstance(probability, bool)
+                    or not isinstance(probability, (int, float))
+                    or not 0 <= probability <= 1
+                    or not math.isfinite(probability)
+                ):
+                    invalid("Choice probabilities must be finite and bounded")
+                checked.append(float(probability))
+            if abs(math.fsum(checked) - 1.0) > 1e-6:
+                invalid("Choice probabilities must sum to one")
+            if probabilities[answer.option] != max(checked):
+                invalid("Choice answer must have the highest probability")
+            if (
+                isinstance(answer.confidence, bool)
+                or not isinstance(answer.confidence, (int, float))
+                or not 0 <= answer.confidence <= 1
+                or not math.isfinite(answer.confidence)
+            ):
+                invalid("Choice confidence must be finite and bounded")
+        else:
+            if type(answer) is not NoulAnswer:
+                invalid("Noul questions require NoulAnswer results")
+            probability = answer.probability_yes
+            if (
+                isinstance(probability, bool)
+                or not isinstance(probability, (int, float))
+                or not 0 <= probability <= 1
+                or not math.isfinite(probability)
+            ):
+                invalid("Noul yes-probability must be finite and between zero and one")
+
+    duration = result.duration_seconds
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not 0 <= duration <= 3600 or not math.isfinite(duration):
+        invalid("Batch duration must be finite and bounded")
+    if result.model is not None and (
+        type(result.model) is not str
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}", result.model)
+    ):
+        invalid("Batch model metadata is invalid")
+    for field, value in (("input_tokens", result.input_tokens), ("output_tokens", result.output_tokens)):
+        if value is not None and (type(value) is not int or not 0 <= value <= 10_000_000):
+            invalid(f"Batch {field} metadata is invalid")
+
+
 @dataclass(frozen=True)
 class JudgeTrace:
     option: str

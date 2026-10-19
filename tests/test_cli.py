@@ -66,6 +66,110 @@ class CliTests(unittest.TestCase):
         self.assertIsNone(value["usage"]["cost_credits"])
         self.assertFalse(self.state.exists())
 
+    def test_classification_requires_reviewed_external_input_and_never_initializes_state(self):
+        request_path = PROJECT / "examples" / "optimization" / "request.json"
+        denied = self.command("classify", "--request", request_path, expected_code=2)
+        self.assertEqual(denied["error"]["code"], "provider_blocked_external_not_allowed")
+        missing_key = self.command("classify", "--request", request_path, "--allow-external", expected_code=2)
+        self.assertEqual(missing_key["error"]["code"], "provider_credentials_missing")
+        malformed = self.root / "duplicate-keys.json"
+        malformed.write_text('{"schema_version":1,"schema_version":1}', encoding="utf-8")
+        invalid = self.command("classify", "--request", malformed, "--allow-external", expected_code=2)
+        self.assertEqual(invalid["error"]["code"], "invalid_opportunity_request")
+        self.assertFalse(self.state.exists())
+
+    def test_assessment_requires_reviewed_external_input_without_creating_state(self):
+        request_path = PROJECT / "examples" / "optimization" / "request.json"
+        denied = self.command("assess", "--request", request_path, expected_code=2)
+        self.assertEqual(denied["error"]["code"], "provider_blocked_external_not_allowed")
+        missing_key = self.command("assess", "--request", request_path, "--allow-external", expected_code=2)
+        self.assertEqual(missing_key["error"]["code"], "provider_credentials_missing")
+        malformed = self.root / "assessment-duplicate-keys.json"
+        malformed.write_text('{"schema_version":1,"schema_version":1}', encoding="utf-8")
+        invalid = self.command("assess", "--request", malformed, "--allow-external", expected_code=2)
+        self.assertEqual(invalid["error"]["code"], "invalid_opportunity_request")
+        self.assertFalse(self.state.exists())
+
+    def test_assessment_cli_keeps_nonexclusive_directions_and_single_batch_usage(self):
+        from abs_evolution.cli import main
+
+        request_path = PROJECT / "examples" / "optimization" / "request.json"
+        wire = b"OK\n" + json.dumps({
+            "model": "jev-1.13.0",
+            "answers": {
+                "opportunity": {"type": "choice", "choice": "worth_comparing", "confidence": 0.9,
+                                "probabilities": {"worth_comparing": 0.95, "no_opportunity": 0.03,
+                                                  "insufficient_evidence": 0.02}},
+                "quality": {"type": "noul", "noul": 0.1},
+                "efficiency": {"type": "noul", "noul": 0.92},
+                "method": {"type": "noul", "noul": 0.88},
+                "reuse": {"type": "noul", "noul": 0.55},
+            },
+            "usage": {"input_tokens": 160, "output_tokens": 90},
+        }).encode()
+        stream = io.StringIO()
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "fixture-assessment-key"}, clear=True), \
+                mock.patch("abs_evolution.jev._execute_worker", return_value=wire) as transport, \
+                contextlib.redirect_stdout(stream):
+            code = main(["--state", str(self.state), "assess", "--request", str(request_path), "--allow-external"])
+        self.assertEqual(code, 0)
+        output = json.loads(stream.getvalue())
+        self.assertEqual(output["decision"], "worth_comparing")
+        self.assertEqual(output["supported_dimensions"], ["efficiency", "method"])
+        self.assertEqual(output["dimensions"]["reuse"], {"probability_yes": 0.55, "status": "uncertain"})
+        self.assertEqual(output["next_step"], "compare")
+        self.assertEqual(output["usage"]["input_tokens"], 160)
+        self.assertNotIn("input_tokens", output["opportunity"])
+        self.assertNotIn("observation", output)
+        for field in ("candidate_executed", "registry_changed", "deployment_changed"):
+            self.assertFalse(output[field])
+        self.assertFalse(self.state.exists())
+        transport.assert_called_once()
+
+    def test_classify_cli_uses_real_jev_adapter_without_executing_or_persisting(self):
+        from abs_evolution.cli import main
+
+        request_path = PROJECT / "examples" / "optimization" / "request.json"
+        sent_requests = []
+
+        def respond(worker_input, **_kwargs):
+            # Substitute only the network boundary, not classification or parsing.
+            envelope = json.loads(bytes(worker_input))
+            sent_requests.append(json.loads(envelope["body"]))
+            return b"OK\n" + json.dumps({
+                "model": "jev-1.13.0",
+                "answers": {"decision": {
+                    "type": "choice", "choice": "efficiency", "confidence": 1.0,
+                    "probabilities": {"quality": 0.0, "efficiency": 1.0, "method": 0.0,
+                                      "reuse": 0.0, "no_opportunity": 0.0, "insufficient_evidence": 0.0},
+                }},
+                "usage": {"input_tokens": 100, "output_tokens": 20},
+            }).encode()
+
+        stream = io.StringIO()
+        with mock.patch.dict(os.environ, {"TYPESAFE_API_KEY": "fixture-classification-key"}, clear=True), \
+                mock.patch("abs_evolution.jev._execute_worker", side_effect=respond) as transport, \
+                mock.patch("abs_evolution.openrouter.OpenRouterProvider.propose") as generator, \
+                contextlib.redirect_stdout(stream):
+            exit_code = main([
+                "--state", str(self.state), "classify", "--request", str(request_path), "--allow-external",
+            ])
+        self.assertEqual(exit_code, 0)
+        output = json.loads(stream.getvalue())
+        self.assertEqual(output["dimension"], "efficiency")
+        self.assertEqual(output["next_step"], "compare")
+        self.assertEqual(output["observed_outcome"], "accepted")
+        self.assertEqual(output["judgment"]["input_tokens"], 100)
+        self.assertFalse(output["candidate_executed"])
+        self.assertFalse(output["registry_changed"])
+        self.assertFalse(output["deployment_changed"])
+        self.assertEqual(sent_requests[0]["state"]["request"], json.loads(request_path.read_text()))
+        self.assertEqual(sent_requests[0]["questions"]["decision"]["type"], "choice")
+        self.assertNotIn("observation", output)
+        self.assertFalse(self.state.exists())
+        transport.assert_called_once()
+        generator.assert_not_called()
+
     def test_openrouter_requires_explicit_model_and_reports_missing_credentials(self):
         missing_model = self.command(
             "propose", "--provider", "openrouter", "--request", EXAMPLE / "request.json",
@@ -174,9 +278,29 @@ class CliTests(unittest.TestCase):
                 "evidence_refs": [f"evidence-{number}"],
             }), encoding="utf-8")
             self.command("receipt", "record", receipt)
+            signal_task_id = f"signal-task-{number}"
+            self.command("task", "begin", signal_task_id)
+            self.command("task", "end", signal_task_id)
+            signal_receipt = self.root / f"signal-receipt-{number}.json"
+            signal_receipt.write_text(json.dumps({
+                "id": f"signal-receipt-{number}", "task_id": signal_task_id, "snapshot_id": baseline,
+                "outcome": "accepted", "failure_tags": [], "evidence_refs": [f"signal-evidence-{number}"],
+                "task_family": "support",
+                "optimization_signals": [{"dimension": "efficiency", "tag": "fewer_steps"}],
+            }), encoding="utf-8")
+            self.command("receipt", "record", signal_receipt)
         output = self.command("opportunities")
-        self.assertEqual(output["opportunities"][0]["distinct_tasks"], 2)
-        self.assertEqual(output["opportunities"][0]["status"], "needs_investigation")
+        failure, optimization = output["opportunities"]
+        self.assertEqual(failure["failure_tag"], "premature_acceptance")
+        self.assertEqual(failure["distinct_tasks"], 2)
+        self.assertEqual(failure["status"], "needs_investigation")
+        self.assertEqual(optimization["tag"], "fewer_steps")
+        self.assertEqual(optimization["signal_type"], "optimization")
+        self.assertEqual(optimization["observed_outcomes"], ["accepted"])
+        self.assertEqual(optimization["status"], "needs_comparison")
+        state = self.command("status")
+        self.assertEqual(state["counts"]["experiments"], 0)
+        self.assertEqual(state["channels"][0]["snapshot_id"], baseline)
 
     @unittest.skipUnless(sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").exists(),
                          "requires the actual macOS sandbox backend")

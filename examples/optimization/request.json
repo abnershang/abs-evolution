@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "task_family": "source-backed-summary",
+  "objective": "Preserve accurate source-backed conclusions while reducing repeated source reads.",
+  "observation": "In these synthetic accepted tasks, unchanged source passages were fetched repeatedly before the summary was written.",
+  "outcome": "accepted",
+  "evidence": [
+    {
+      "id": "synthetic-summary-a",
+      "summary": "A reviewer accepted the summary and its citations. Six source reads included three repeat reads of unchanged passages. No measured saving from an alternative exists yet."
+    },
+    {
+      "id": "synthetic-summary-b",
+      "summary": "A second summary was accepted with the required coverage. Its trace contains two repeat reads of already retrieved unchanged passages. Reuse of retrieved passages is a hypothesis to compare."
+    }
+  ]
+}

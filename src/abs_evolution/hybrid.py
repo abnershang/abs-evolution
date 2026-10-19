@@ -17,6 +17,7 @@ from .contracts import (
     RoutingTrace,
     canonical_json,
     fingerprint,
+    validate_choice_result,
     validated_routing,
 )
 from .errors import EvolutionError
@@ -144,38 +145,6 @@ class HybridProposalProvider:
         return validated
 
     @staticmethod
-    def _validate_choice(choice: ChoiceResult, expected_options: set[str]) -> None:
-        if not isinstance(choice, ChoiceResult):
-            _raise("provider_invalid_judgement", "JEV returned an unsupported typed-choice result")
-        if choice.option not in expected_options:
-            _raise("provider_invalid_judgement", "JEV selected an option that was not supplied")
-        probabilities = choice.probabilities
-        if not isinstance(probabilities, dict) or set(probabilities) != expected_options:
-            _raise("provider_invalid_judgement", "JEV probabilities must cover every supplied option exactly")
-        checked: list[float] = []
-        for probability in probabilities.values():
-            if isinstance(probability, bool) or not isinstance(probability, (float, int)) or not math.isfinite(probability) or not 0 <= probability <= 1:
-                _raise("provider_invalid_judgement", "JEV probabilities must be finite and bounded")
-            checked.append(float(probability))
-        if abs(sum(checked) - 1.0) > 1e-6:
-            _raise("provider_invalid_judgement", "JEV probabilities must sum to one")
-        maximum = max(checked)
-        if probabilities[choice.option] != maximum:
-            _raise("provider_invalid_judgement", "JEV choice must have the highest probability")
-        if isinstance(choice.confidence, bool) or not isinstance(choice.confidence, (float, int)) or not math.isfinite(choice.confidence) or not 0 <= choice.confidence <= 1:
-            _raise("provider_invalid_judgement", "JEV confidence must be finite and bounded")
-        if isinstance(choice.duration_seconds, bool) or not isinstance(choice.duration_seconds, (float, int)) or not math.isfinite(choice.duration_seconds) or not 0 <= choice.duration_seconds <= 3600:
-            _raise("provider_invalid_judgement", "JEV duration must be finite and bounded")
-        if choice.model is not None and (
-            not isinstance(choice.model, str)
-            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,255}", choice.model)
-        ):
-            _raise("provider_invalid_judgement", "JEV model metadata is invalid")
-        for field, value in (("input_tokens", choice.input_tokens), ("output_tokens", choice.output_tokens)):
-            if value is not None and (type(value) is not int or not 0 <= value <= 10_000_000):
-                _raise("provider_invalid_judgement", f"JEV {field} metadata is invalid")
-
-    @staticmethod
     def _judge_trace(choice: ChoiceResult) -> JudgeTrace:
         return JudgeTrace(
             option=choice.option,
@@ -232,21 +201,25 @@ class HybridProposalProvider:
         criteria = {
             **{
                 f"reuse_{candidate['id']}": (
-                    "Reuse this exact supplied proposal only if the training examples show it addresses "
-                    "the observed failures while preserving the passing cases. Do not alter it."
+                    "Reuse this exact supplied proposal if it supports the stated objective, is consistent with the available "
+                    "training evidence, and preserves already-passing behavior. It may support a quality, efficiency, method, "
+                    "or reuse hypothesis even when all training examples pass or no failure is present. Treat routing only as "
+                    "a proposal-selection hypothesis, not proof of acceptance or gain. Do not alter the proposal."
                 )
                 for candidate in candidates
             },
-            "generate": "New proposal content is needed because no supplied candidate is a sufficiently supported fit.",
-            "insufficient_evidence": "The request and training evidence do not support either reuse or new proposal generation.",
+            "generate": "New proposal content is justified by the stated objective and available training evidence, and no supplied candidate is a sufficiently supported fit.",
+            "insufficient_evidence": "The stated objective and available training evidence do not support a confident choice to reuse or generate proposal content.",
         }
         choice = self.judge.choose(
             json.loads(state_json),
             instructions=(
-                "Choose exactly one route using only the supplied request, its training examples, and all supplied candidates. "
-                "A reuse option means the corresponding proposal must be returned exactly as supplied. Select generate "
-                "only when new proposal content is justified by the training evidence. Select insufficient_evidence "
-                "when evidence is inadequate. Do not invent candidates, inspect holdout data, or execute changes."
+                "Choose exactly one route using only the stated objective, supplied training examples, and all supplied candidates. "
+                "Support continuous improvement: a successful task may still have a quality, efficiency, method, or reuse objective, "
+                "and a reusable candidate can fit even when all training examples pass. A reuse option means return the corresponding "
+                "proposal exactly as supplied. Select generate only when new proposal content is justified by the stated objective "
+                "and available evidence; otherwise select insufficient_evidence when no confident route is supported. Routing is not "
+                "acceptance or proof of gain. Do not invent candidates, inspect holdout data, or execute changes."
             ),
             criteria=criteria,
             timeout_seconds=remaining,
@@ -254,7 +227,7 @@ class HybridProposalProvider:
         )
         if time.monotonic() >= deadline:
             _raise("provider_timeout", "JEV judgment exceeded the shared provider deadline")
-        self._validate_choice(choice, set(options))
+        validate_choice_result(choice, set(options))
         if choice.option == "insufficient_evidence":
             _raise("provider_blocked_uncertain", "JEV found insufficient evidence to select a proposal route")
         selected_probability = choice.probabilities[choice.option]
