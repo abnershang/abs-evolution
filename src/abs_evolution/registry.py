@@ -600,6 +600,7 @@ class Registry:
         if destination.exists():
             _error("snapshot_orphan", "Snapshot address exists without registry metadata")
         stage = Path(tempfile.mkdtemp(prefix=".staging-", dir=self._snapshots_path))
+        renamed = False
         try:
             files_dir = stage / "files"
             files_dir.mkdir(mode=0o700)
@@ -632,9 +633,15 @@ class Registry:
             for directory in sorted(created_dirs, key=lambda item: len(item.parts), reverse=True):
                 os.chmod(directory, 0o555)
             os.chmod(files_dir, 0o555)
-            os.chmod(stage, 0o555)
+            # macOS can require write permission on the directory being moved.
+            # Seal its root after rename, before publishing registry metadata;
+            # readers remain excluded by the enclosing write transaction.
             os.rename(stage, destination)
+            renamed = True
+            os.chmod(destination, 0o555)
         except OSError as exc:
+            if renamed:
+                self._remove_tree(destination)
             raise EvolutionError("snapshot_write_failed", "Immutable snapshot could not be written") from exc
         finally:
             if stage.exists():

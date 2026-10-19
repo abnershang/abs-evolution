@@ -66,7 +66,7 @@ jobs:
         run: |
           python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/wheels" .
           python -m venv "$RUNNER_TEMP/installed"
-          "$RUNNER_TEMP/installed/bin/python" -m pip install --no-index --no-deps --find-links "$RUNNER_TEMP/wheels" abs-evolution
+          "$RUNNER_TEMP/installed/bin/python" -I -m pip install --no-index --no-deps --find-links "$RUNNER_TEMP/wheels" abs-evolution
       - name: Verify the installed entry point outside the checkout
         shell: bash
         env:
