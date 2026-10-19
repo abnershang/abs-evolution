@@ -272,6 +272,19 @@ installed proposal-only CLI outside the checkout. No provider credentials are
 configured, and no live model calls, deployment or publication is part of CI.
 Passing these checks does not remove the hard-resource execution gate.
 
+A separate Linux-only feasibility job runs fixed reviewed probes in a
+digest-pinned official Python container, with no host mounts or injected keys.
+It exercises OOM termination at 64 MiB (no swap), aggregate writes to an 8 MiB
+scratch tmpfs and 1 MiB shared-memory mount, a 16-process ceiling, CPU throttling,
+network denial, read-only root storage, and deadline/descendant cleanup.
+Each probe removes its own container. This is **not** the engine's execution
+backend, an audit against container escapes, or unattended-readiness evidence.
+It runs only on disposable GitHub Linux runners; the Mac Docker daemon is not
+started. No arbitrary candidate source is accepted by this probe script.
+The limits follow Docker's [resource constraints](https://docs.docker.com/engine/containers/resource_constraints/)
+and [tmpfs semantics](https://docs.docker.com/engine/storage/tmpfs/); tmpfs memory
+also counts toward the container memory ceiling.
+
 ## Research used
 
 The implementation is original and has no runtime dependency on these projects.
