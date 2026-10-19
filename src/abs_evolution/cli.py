@@ -127,7 +127,8 @@ def parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init", help="Create a new isolated registry")
     init.add_argument("--policy", type=Path)
     commands.add_parser("status", help="Read local registry state")
-    commands.add_parser("doctor", help="Probe the local execution sandbox without model calls")
+    doctor = commands.add_parser("doctor", help="Probe the local execution sandbox without model calls")
+    doctor.add_argument("--sandbox", choices=("seatbelt", "docker"), default="seatbelt")
 
     snapshots = commands.add_parser("snapshot").add_subparsers(dest="action", required=True)
     capture = snapshots.add_parser("import", help="Copy an explicit source into immutable storage")
@@ -180,6 +181,8 @@ def parser() -> argparse.ArgumentParser:
     propose.add_argument("--max-output-bytes", type=int, default=262144)
 
     evolve = commands.add_parser("evolve", help="Run one bounded, isolated experiment")
+    evolve.add_argument("--sandbox", choices=("seatbelt", "docker"), default="seatbelt",
+                        help="Explicit backend; Docker requires a prepared Linux host and pinned image")
     evolve.add_argument("--suite", type=Path, required=True)
     _provider_arguments(evolve)
     evolve.add_argument("--channel", default="stable")
@@ -189,6 +192,14 @@ def parser() -> argparse.ArgumentParser:
         help="Explicitly allow a supervised local run without hard RAM or aggregate scratch quotas; not for unattended use",
     )
     return result
+
+
+def _execution_sandbox(name: str):
+    if name == "docker":
+        from .docker_sandbox import DockerSandbox
+        return DockerSandbox()
+    from .sandbox import Sandbox
+    return Sandbox()
 
 
 def dispatch(args: argparse.Namespace):
@@ -221,14 +232,13 @@ def dispatch(args: argparse.Namespace):
             output["routing"] = validated_routing(proposal.routing)
         return output
     if args.command == "doctor":
-        from .sandbox import Sandbox
         with tempfile.TemporaryDirectory(prefix="abs-evolution-probe-") as raw:
             scratch = Path(raw).resolve()
-            sandbox = Sandbox()
+            sandbox = _execution_sandbox(args.sandbox)
             probe = sandbox.run(
                 [sys.executable, "-I", "-S", "-c", "print('sandbox-ready')"],
                 cwd=scratch, read_paths=[scratch], write_paths=[scratch],
-                timeout_seconds=5, max_output_bytes=4096,
+                timeout_seconds=30 if args.sandbox == "docker" else 5, max_output_bytes=4096,
             )
             data = asdict(probe)
             data["model_called"] = False
@@ -281,9 +291,8 @@ def dispatch(args: argparse.Namespace):
         return {"policy": policy.to_dict(), "digest": policy.digest}
     if args.command == "evolve":
         from .engine import EvolutionEngine
-        from .sandbox import Sandbox
         provider = _proposal_provider(args)
-        return EvolutionEngine(registry, Sandbox(), provider).run(
+        return EvolutionEngine(registry, _execution_sandbox(args.sandbox), provider).run(
             args.suite, auto_promote=args.promote, channel=args.channel,
             allow_shared_resources=args.allow_shared_resources,
         )

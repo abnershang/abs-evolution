@@ -18,10 +18,14 @@ acceptance. Real model calls and offline proposal fixtures are reported
 separately in verification results.
 
 Current execution is supervised only. Seatbelt provides access isolation, not
-hard RAM or aggregate scratch-storage quotas. The engine blocks by default;
-the reviewed fixture requires an explicit shared-resource exception. Before
-unattended experiments, add and verify a backend with enforced resource quotas.
-Do not treat process timeouts, low concurrency or documentation as substitutes.
+hard RAM or aggregate scratch-storage quotas. The default backend blocks without
+the reviewed-code shared-resource exception. The explicitly selected Linux
+Docker backend supplies runtime-verified quotas and is exercised by a disposable
+CI lifecycle: evaluation, promotion, actual pinned-version consumption, rollback
+and rejection of a memory-exhausting candidate. It does not start a local Docker
+daemon, enable background runs, install ABS or prove real instruction quality.
+Do not treat this synthetic closed loop as desktop adoption or autonomous
+model-generated improvement.
 
 The OpenRouter adapter adds tool-free, structured model proposals with explicit
 model selection, existing process credentials, restrictive routing, bounded

@@ -84,6 +84,19 @@ result. Separate stdout/stderr but enforce one combined byte limit.
 memory and aggregate scratch-storage quotas are not enforced. The engine must
 block by default rather than confuse access isolation with resource isolation.
 
+`DockerSandbox` is an explicit Linux-only alternative with the same run
+signature but narrower invocation semantics: only isolated Python, one snapshot
+read root, and one scratch directory equal to `cwd`. The snapshot is mounted
+read-only at `/candidate`; scratch is an ephemeral container mount and is never
+copied back to the host. Unsupported requests fail closed. The local Unix-socket
+daemon and digest-pinned image must already exist; no implicit daemon startup,
+pull, remote Docker endpoint or unsandboxed fallback is permitted. Runtime
+admission verifies hard-resource controls before claiming capability. Limits
+and the pinned image are part of the backend identity. Timeout/output overflow
+must stop and remove the container, not merely its attached client process.
+Neither Docker capability nor an accepted registry version means deployment or
+unattended desktop readiness.
+
 Python candidate invocation is `[sys.executable, "-I", "-S", entrypoint]`.
 `read_paths` contains the snapshot only, never the registry database, evaluator,
 suite files, expected answers or other versions. Candidate input is one JSON

@@ -21,16 +21,17 @@ modified. Existing desktop tasks do not automatically acquire registry leases.
 ## Run without installing dependencies
 
 Use Python 3.12+ from this project directory. The core uses only the standard
-library. Candidate execution currently requires macOS with a functioning
+library. Default candidate execution uses macOS with a functioning
 `sandbox-exec`; unsupported or unavailable isolation blocks experiments.
-The engine never starts Docker or falls back to ordinary subprocess execution.
+An explicit Linux Docker backend is described below. The engine never starts a
+Docker daemon, pulls images, or falls back to ordinary subprocess execution.
 
 Seatbelt isolates filesystem and network access but does not enforce hard RAM
 or aggregate scratch-storage quotas. Experiments therefore block by default.
 `--allow-shared-resources` is an explicit opt-in for a supervised local run of
 reviewed code that shares host resources. It is not suitable for unattended
-model-generated code. A backend with enforced resource quotas is still required
-before enabling automatic experiments.
+model-generated code. The Linux Docker backend enforces resource quotas, but
+does not itself enable automatic experiments or desktop integration.
 
 ```sh
 PYTHONPATH=src python3 -m abs_evolution --help
@@ -117,6 +118,34 @@ private transcripts, unapproved business data or protected acceptance answers.
 Unlike a reviewed file proposal, model-generated code cannot use
 `--allow-shared-resources` to bypass missing resource quotas. Proposal generation
 works independently of that execution gate.
+
+### Explicit Linux execution with hard quotas
+
+On a prepared Linux host, `doctor --sandbox docker` probes the existing local
+Docker daemon and pinned image. `evolve --sandbox docker` selects that same
+backend explicitly. The default remains Seatbelt, including on Linux, so a
+missing explicit selection cannot silently start containers.
+
+```sh
+PYTHONPATH=src python3 -m abs_evolution doctor --sandbox docker
+PYTHONPATH=src python3 -m abs_evolution --state /absolute/path/to/state evolve --sandbox docker --suite examples/acceptance/suite.json --provider file --proposal-file examples/acceptance/proposal.json
+```
+
+The backend requires the exact image pinned in `docker_sandbox.py` to be
+prepared by the operator; it never downloads an image or starts a daemon.
+Candidates receive only their snapshot, mounted read-only at `/candidate`,
+and ephemeral scratch at `/tmp`. Scratch writes are discarded, not copied back
+to the host `cwd`. Only isolated Python invocation is supported, not arbitrary
+host executables. Registry state, other snapshots, the evaluator and protected
+acceptance answers are not mounted.
+
+Runtime admission must pass resource/isolation checks before the backend claims
+hard limits. Candidate runs enforce memory, scratch, process, CPU, combined
+output and execution-time bounds; container cleanup includes descendants.
+This relies on the trusted Linux kernel and Docker daemon, not a VM-level
+defense against kernel/container escapes. `unattended_ready` remains false:
+desktop lifecycle integration, operational supervision and real ABS capability
+evaluation are separate work.
 
 `--provider codex` remains blocked without starting a Codex process. The
 inspected CLI cannot establish a verifiable zero-tool boundary. The offline
@@ -252,8 +281,9 @@ diagnoses or permission to change every task's shared instructions.
   valid program producing the wrong answer. Neither is silently called success.
 - This is single-host local SQLite coordination. It is not a distributed lock,
   a defense against a malicious operator, or proof of desktop-session adoption.
-- The current sandbox does not enforce hard RAM or aggregate scratch quotas.
-  Its successful access-isolation probe is not evidence of unattended readiness.
+- Seatbelt does not enforce hard RAM or aggregate scratch quotas. The explicitly
+  selected Linux Docker backend verifies and enforces these limits; neither
+  backend alone establishes unattended readiness.
 
 See [the implementation contracts](docs/contracts.md) for schemas and lifecycle
 rules, and [the implementation stages](docs/implementation.md) for the remaining
@@ -272,18 +302,25 @@ installed proposal-only CLI outside the checkout. No provider credentials are
 configured, and no live model calls, deployment or publication is part of CI.
 Passing these checks does not remove the hard-resource execution gate.
 
-A separate Linux-only feasibility job runs fixed reviewed probes in a
+A separate Linux-only job first runs fixed reviewed feasibility probes in a
 digest-pinned official Python container, with no host mounts or injected keys.
 It exercises OOM termination at 64 MiB (no swap), aggregate writes to an 8 MiB
 scratch tmpfs and 1 MiB shared-memory mount, a 16-process ceiling, CPU throttling,
 network denial, read-only root storage, and deadline/descendant cleanup.
-Each probe removes its own container. This is **not** the engine's execution
-backend, an audit against container escapes, or unattended-readiness evidence.
+Each probe removes its own container. These independent probes are **not** an
+audit against container escapes or unattended-readiness evidence.
 It runs only on disposable GitHub Linux runners; the Mac Docker daemon is not
 started. No arbitrary candidate source is accepted by this probe script.
 The limits follow Docker's [resource constraints](https://docs.docker.com/engine/containers/resource_constraints/)
 and [tmpfs semantics](https://docs.docker.com/engine/storage/tmpfs/); tmpfs memory
 also counts toward the container memory ceiling.
+
+The same job then tests the actual Docker backend and runs the public CLI
+through offline evaluation, explicit promotion, execution of pinned old/new
+versions, rollback and execution after rollback. A negative-control candidate
+exceeds its real memory limit and must leave the channel unchanged. The scores
+measure only the bundled synthetic fixture, not model-generated improvement or
+real ABS skill quality. No model provider is called.
 
 ## Research used
 

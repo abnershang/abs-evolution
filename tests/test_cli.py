@@ -44,6 +44,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual(value["error"]["code"], "state_missing")
         self.assertFalse(self.state.exists())
 
+    @unittest.skipIf(sys.platform == "linux", "non-Linux fail-closed selection contract")
+    def test_explicit_docker_on_unsupported_host_never_falls_back_to_seatbelt(self):
+        doctor = self.command("doctor", "--sandbox", "docker", expected_code=2, with_state=False)
+        self.assertEqual(doctor["status"], "blocked")
+        self.assertFalse(doctor["hard_resource_limits"])
+        self.assertFalse(doctor["unattended_ready"])
+        self.assertFalse(doctor["model_called"])
+        self.assertFalse(self.state.exists())
+
     def test_proposal_only_command_does_not_require_or_create_registry_state(self):
         value = self.command(
             "propose", "--provider", "file", "--request", EXAMPLE / "request.json",
