@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "acceptance-contract-v1",
+  "mode": "python",
+  "entrypoint": "tools/acceptance.py",
+  "training": [
+    {"id": "build-is-not-acceptance", "input": {"goal": "delivery", "records": [{"goal": "delivery", "kind": "build", "accepted": true}]}, "expected": {"accepted": false}},
+    {"id": "accepted-delivery", "input": {"goal": "delivery", "records": [{"goal": "delivery", "kind": "acceptance", "accepted": true}]}, "expected": {"accepted": true}},
+    {"id": "no-evidence", "input": {"goal": "delivery", "records": []}, "expected": {"accepted": false}},
+    {"id": "wrong-goal", "input": {"goal": "reconciliation", "records": [{"goal": "delivery", "kind": "acceptance", "accepted": true}]}, "expected": {"accepted": false}}
+  ],
+  "holdout": [
+    {"id": "transport-only", "input": {"goal": "publication", "records": [{"goal": "publication", "kind": "transport", "accepted": true}]}, "expected": {"accepted": false}},
+    {"id": "mixed-evidence", "input": {"goal": "report", "records": [{"goal": "report", "kind": "build", "accepted": true}, {"goal": "report", "kind": "acceptance", "accepted": true}]}, "expected": {"accepted": true}},
+    {"id": "explicit-rejection", "input": {"goal": "publication", "records": [{"goal": "publication", "kind": "acceptance", "accepted": false}]}, "expected": {"accepted": false}},
+    {"id": "truthy-is-not-true", "input": {"goal": "report", "records": [{"goal": "report", "kind": "acceptance", "accepted": 1}]}, "expected": {"accepted": false}}
+  ]
+}

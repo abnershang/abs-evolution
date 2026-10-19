@@ -1,0 +1,10 @@
+{
+  "summary": "Require explicit acceptance for the exact requested goal; this is a reviewed offline fixture, not model output.",
+  "kind": "tool",
+  "changes": [
+    {
+      "path": "tools/acceptance.py",
+      "content": "import json\nimport sys\n\ndata = json.load(sys.stdin)\naccepted = any(record.get('goal') == data.get('goal') and record.get('kind') == 'acceptance' and record.get('accepted') is True for record in data.get('records', []))\nprint(json.dumps({'accepted': accepted}))\n"
+    }
+  ]
+}

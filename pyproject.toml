@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "abs-evolution"
+version = "0.1.0"
+description = "Isolated, evidence-gated evolution experiments for ABS"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+abs-evolution = "abs_evolution.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

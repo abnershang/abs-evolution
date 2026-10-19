@@ -1,0 +1,77 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python: "3.12"
+          - os: macos-15
+            python: "3.14"
+    env:
+      PYTHONPATH: src
+      OPENROUTER_API_KEY: ""
+      TYPESAFE_API_KEY: ""
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Verify the platform isolation contract
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          probe = subprocess.run(
+              [sys.executable, "-m", "abs_evolution", "doctor"],
+              capture_output=True, text=True, timeout=15,
+          )
+          receipt = json.loads(probe.stdout)
+          expected = (0, "passed", "macos-seatbelt") if sys.platform == "darwin" else (2, "blocked", "unsupported")
+          actual = (probe.returncode, receipt["status"], receipt["backend"])
+          if actual != expected:
+              raise SystemExit(f"Unexpected sandbox capability: {actual!r}")
+          for flag in ("hard_resource_limits", "unattended_ready", "model_called", "deployment_changed"):
+              if receipt[flag] is not False:
+                  raise SystemExit(f"Unexpected capability or side effect: {flag}")
+          print(json.dumps(receipt, sort_keys=True))
+          PY
+      - name: Run the offline suite
+        run: python -m unittest discover -s tests -v
+      - name: Build and install the wheel in an isolated environment
+        shell: bash
+        run: |
+          python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/wheels" .
+          python -m venv "$RUNNER_TEMP/installed"
+          "$RUNNER_TEMP/installed/bin/python" -m pip install --no-index --no-deps --find-links "$RUNNER_TEMP/wheels" abs-evolution
+      - name: Verify the installed entry point outside the checkout
+        shell: bash
+        env:
+          PYTHONPATH: ""
+        run: |
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/installed/bin/abs-evolution" --help
+          "$RUNNER_TEMP/installed/bin/python" "$GITHUB_WORKSPACE/scripts/check_installed.py" "$GITHUB_WORKSPACE/examples/acceptance"

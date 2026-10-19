@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "objective": "Repair this synthetic tool to follow its documented acceptance contract while preserving passing training behavior. Change only tools/acceptance.py.",
+  "baseline_id": "synthetic-acceptance-v1",
+  "files": {
+    "tools/acceptance.py": "\"\"\"Synthetic benchmark with an intentionally defective implementation.\n\nAn outcome is accepted only when at least one evidence record has the exact\nrequested goal, kind='acceptance', and accepted is the JSON boolean true.\nBuild, transport and implementation observations never establish acceptance.\nThe output is exactly {\"accepted\": <boolean>}. Input is one JSON object with\n`goal` and a list of `records`. Do not use external services or filesystem data.\n\"\"\"\n\nimport json\nimport sys\n\ndata = json.load(sys.stdin)\nprint(json.dumps({\"accepted\": bool(data.get(\"records\"))}))\n"
+  },
+  "training_examples": [
+    {"id": "build-is-not-acceptance", "input": {"goal": "delivery", "records": [{"goal": "delivery", "kind": "build", "accepted": true}]}, "expected": {"accepted": false}, "actual": {"accepted": true}, "passed": false},
+    {"id": "accepted-delivery", "input": {"goal": "delivery", "records": [{"goal": "delivery", "kind": "acceptance", "accepted": true}]}, "expected": {"accepted": true}, "actual": {"accepted": true}, "passed": true},
+    {"id": "no-evidence", "input": {"goal": "delivery", "records": []}, "expected": {"accepted": false}, "actual": {"accepted": false}, "passed": true},
+    {"id": "wrong-goal", "input": {"goal": "reconciliation", "records": [{"goal": "delivery", "kind": "acceptance", "accepted": true}]}, "expected": {"accepted": false}, "actual": {"accepted": true}, "passed": false}
+  ],
+  "allowed_mutation_paths": ["tools/*"],
+  "max_changes": 1
+}
